@@ -6,6 +6,7 @@
 
 import { Gemma4Mobile, DEFAULT_MODEL_ID } from '../src/index';
 import type { Gemma4Message, Gemma4Progress } from '../src/index';
+import { smokeTest, allocationLadder, type SmokeResult, type AllocResult } from './probe';
 
 const $ = (id: string): HTMLElement => {
   const el = document.getElementById(id);
@@ -49,6 +50,9 @@ interface PromptResult {
 }
 
 interface Result {
+  /** FAILED means do not quote any number below it. See `failures`. */
+  verdict: 'ok' | 'FAILED';
+  failures: string[];
   measuredAt: string;
   userAgent: string;
   modelId: string;
@@ -56,10 +60,37 @@ interface Result {
   device: unknown;
   loadSeconds: number;
   maxNewTokens: number;
+  reducePolicy: string | null;
+  smoke: SmokeResult | null;
+  allocation: AllocResult | null;
   prompts: PromptResult[];
 }
 
 let result: Result | null = null;
+let smoke: SmokeResult | null = null;
+let alloc: AllocResult | null = null;
+
+/**
+ * A run is only reportable if it produced text and moved at a physically possible rate. An iPhone
+ * once reported 3705 tok/s on empty output because the dispatches were silently not running; a
+ * page that prints that number is worse than a page that prints nothing.
+ */
+const PLAUSIBLE_MAX_TOK_PER_SEC = 500;
+
+function validate(rows: PromptResult[]): string[] {
+  const failures: string[] = [];
+  for (const r of rows) {
+    if (r.text.trim() === '') {
+      failures.push(`prompt "${r.name}" produced no text, so the engine generated nothing`);
+    }
+    if (r.decodeTokPerSec > PLAUSIBLE_MAX_TOK_PER_SEC) {
+      failures.push(`prompt "${r.name}" reported ${r.decodeTokPerSec} tok/s, above the `
+        + `${PLAUSIBLE_MAX_TOK_PER_SEC} tok/s plausibility ceiling, so the work did not run`);
+    }
+    if (r.decodeTokPerSec <= 0) failures.push(`prompt "${r.name}" reported no decode rate`);
+  }
+  return failures;
+}
 
 // ------------------------------------------------------------------ stage 1, the device profile
 
@@ -110,11 +141,40 @@ async function profile(): Promise<Record<string, unknown> | null> {
   out.innerHTML = `<div class="scroll"><table>${
     rows.map(([k, v]) => `<tr><th>${k}</th><td class="n">${escapeHtml(v)}</td></tr>`).join('')
   }</table></div>` + (canRun
-    ? '<p class="ok" style="margin-bottom:0">This device can run the engine.</p>'
+    ? ''
     : `<p class="bad" style="margin-bottom:0">Missing required feature: ${missing.join(', ')}. `
       + 'The engine will not run here.</p>');
 
-  if (canRun) ($('bench') as HTMLButtonElement).disabled = false;
+  if (!canRun) return { info, features, limits };
+
+  // The cheap probes. These are why a failure is diagnosable without a 2 GB download.
+  out.insertAdjacentHTML('beforeend', '<p id="probing">Running GPU smoke test and allocation ladder...</p>');
+  let device: GPUDevice | null = null;
+  try {
+    device = await adapter.requestDevice({ requiredFeatures: ['shader-f16' as GPUFeatureName] });
+  } catch (err) {
+    $('probing').outerHTML = `<p class="bad">The adapter refused a device: ${escapeHtml(String(err))}</p>`;
+    return { info, features, limits };
+  }
+  smoke = await smokeTest(device);
+  alloc = await allocationLadder(device);
+  device.destroy();
+
+  const memOk = alloc.fitsTotal && alloc.fitsSingle;
+  $('probing').outerHTML = `<div class="scroll"><table>
+    <tr><th>compute correctness</th><td class="n ${smoke.computeOk ? 'ok' : 'bad'}">${
+      smoke.computeOk ? 'PASS' : 'FAIL'} ${escapeHtml(smoke.computeDetail)}</td></tr>
+    <tr><th>GPU errors</th><td class="n">${smoke.errors.length ? escapeHtml(smoke.errors.join(' | ')) : 'none'}</td></tr>
+    <tr><th>largest single buffer</th><td class="n">${alloc.largestSingleMiB} MiB</td></tr>
+    <tr><th>total granted</th><td class="n ${memOk ? 'ok' : 'bad'}">${alloc.totalMiB} MiB of about ${alloc.neededTotalMiB} MiB needed</td></tr>
+  </table></div><p class="${smoke.computeOk && memOk ? 'ok' : 'bad'}" style="margin-bottom:0">${
+    smoke.computeOk && memOk
+      ? 'This device can run the engine.'
+      : escapeHtml(!smoke.computeOk
+          ? 'This device miscompiles or cannot run the compute path. The benchmark would produce garbage.'
+          : alloc.note + '. The benchmark will not fit and is disabled.')}</p>`;
+
+  if (smoke.computeOk && memOk) ($('bench') as HTMLButtonElement).disabled = false;
   return { info, features, limits, subgroupMinSize: sub.subgroupMinSize, subgroupMaxSize: sub.subgroupMaxSize };
 }
 
@@ -180,7 +240,10 @@ async function bench(adapterInfo: Record<string, unknown> | null): Promise<void>
     live.innerHTML = renderTable(results);
   }
 
+  const failures = validate(results);
   result = {
+    verdict: failures.length === 0 ? 'ok' : 'FAILED',
+    failures,
     measuredAt: new Date().toISOString(),
     userAgent: navigator.userAgent,
     modelId: DEFAULT_MODEL_ID,
@@ -188,9 +251,16 @@ async function bench(adapterInfo: Record<string, unknown> | null): Promise<void>
     device: engine.deviceInfo(),
     loadSeconds: Math.round(loadSeconds * 10) / 10,
     maxNewTokens: MAX_NEW_TOKENS,
+    reducePolicy: engine.reducePolicy(),
+    smoke,
+    allocation: alloc,
     prompts: results,
   };
-  live.innerHTML = renderTable(results)
+  const banner = failures.length === 0
+    ? '<p class="ok"><strong>Run valid.</strong> These numbers are reportable.</p>'
+    : '<p class="bad"><strong>RUN FAILED. Do not quote these numbers.</strong></p><ul class="bad">'
+      + failures.map((f) => `<li>${escapeHtml(f)}</li>`).join('') + '</ul>';
+  live.innerHTML = banner + renderTable(results)
     + '<h2 style="margin-top:1.2rem">Output, so you can see it is coherent</h2>'
     + results.map((r) => `<pre><strong>${r.name}</strong>\n${escapeHtml(r.text)}</pre>`).join('<hr style="border:0;border-top:1px solid var(--line);margin:.8rem 0">');
   ($('copy') as HTMLButtonElement).disabled = false;
