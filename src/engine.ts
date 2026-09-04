@@ -318,6 +318,12 @@ export class Gemma4Mobile {
     // signed CDN URL with per run resume and profile sized IndexedDB chunks. This module supplies
     // the sink and nothing else about how the bytes arrive.
     let uploaded = 0;
+    // Source bytes delivered per tensor. A tensor larger than the loader's piece size arrives in
+    // several calls, and cache.ts fetches pieces through a CONCURRENT POOL and delivers them in
+    // COMPLETION order, not in offset order (its `deliver` chain serializes the sink, it does not
+    // sort it). So "this piece ends at byteLength" does not mean "the tensor is whole", and the
+    // 2-bit repack below must not fire until it is. See ENGINE-PERF section 28.5.
+    const deliveredBytes = new Map<string, number>();
     let tensorCount = 0;
     const receipt = await loadWeights({
       fileUrl: `${root}/model.safetensors`,
@@ -382,9 +388,17 @@ export class Gemma4Mobile {
         // Counted when the tensor is complete rather than per call, so the tensors progress event
         // still counts tensors and a resumed load that takes eighteen requests for one table does
         // not report eighteen of 1,439.
-        if (offset + bytes.byteLength >= entry.byteLength) {
+        //
+        // Completeness is the SUM of the source bytes delivered for this tensor, not the end
+        // offset of the piece in hand. Delivery is serialized so this accumulator needs no
+        // atomicity, but it is not ordered, so the piece that ends at byteLength can arrive with
+        // earlier pieces still in flight.
+        const soFar = (deliveredBytes.get(name) ?? 0) + bytes.byteLength;
+        deliveredBytes.set(name, soFar);
+        if (soFar >= entry.byteLength) {
+          deliveredBytes.delete(name);
           // A 2-bit codes tensor is read in the interleaved tile layout (kernels/qlayout.ts):
-          // once its last piece is queued it is repacked on the GPU into a new buffer that takes
+          // once the WHOLE tensor is queued it is repacked on the GPU into a new buffer that takes
           // its name, and the uploaded one is released. The cache keeps the checkpoint bytes.
           const target = tile16Target(name, entry.shape, entry.dtype);
           if (target) {
