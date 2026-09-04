@@ -306,7 +306,7 @@ export class Gemma4Mobile {
       // were actually fetched.
       directory: null,
       gpu,
-      buffers: new BufferManager(asDeviceLike(gpu.device)),
+      buffers: new BufferManager(asDeviceLike(gpu.device), { maxBufferSize: gpu.limits.maxBufferSize }),
       cache,
       scalars: new Map<string, number>(),
       stopTokenIds,

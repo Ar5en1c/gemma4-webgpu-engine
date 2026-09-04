@@ -208,9 +208,20 @@ export class BufferManager {
     bindGroupsReused: 0,
   };
 
-  constructor(device: DeviceLike) {
+  /**
+   * `maxBufferSize` is the device's granted limit, when the caller knows it. WebGPU does not throw
+   * on an over sized createBuffer: it returns an INVALID buffer, every writeBuffer into it fails
+   * the same way, and the load reports success with the tensor never populated. That is how the
+   * PLE table (1,174,405,120 bytes) silently produced garbage on every device with a 1 GiB limit,
+   * every iPhone among them, while the M1's 4 GiB limit hid it. See ENGINE-PERF 28.7.
+   */
+  constructor(device: DeviceLike, limits?: { maxBufferSize?: number }) {
     this.device = device;
+    this.maxBufferSize = limits?.maxBufferSize ?? 0;
   }
+
+  /** Zero means the caller did not say, and the guard below stands down. */
+  private readonly maxBufferSize: number;
 
   private idOf(buffer: BufferLike): number {
     let id = this.bufferIds.get(buffer);
@@ -267,6 +278,15 @@ export class BufferManager {
       throw new Error(
         `BufferManager.uploadWeight: ${name} holds ${buffer.size} bytes and a piece ends at `
         + `${offset + bytes.byteLength}`,
+      );
+    }
+    if (!buffer && this.maxBufferSize > 0 && size > this.maxBufferSize) {
+      throw new Error(
+        `BufferManager.uploadWeight: ${name} needs ${size} bytes in one buffer and this device's `
+        + `maxBufferSize is ${this.maxBufferSize}. WebGPU would return an invalid buffer here and `
+        + 'every write into it would fail, so the tensor would be empty and the model would emit '
+        + 'garbage. This tensor has to be split across buffers (see tableSplit.ts, whose planner '
+        + 'is written and tested but not yet wired into allocation).',
       );
     }
     if (!buffer) {
