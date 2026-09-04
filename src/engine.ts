@@ -38,6 +38,10 @@ import { Gemma4DeviceError, requestGemma4Device, type Gemma4Device } from './dev
 import { resolveUrl, type SafetensorsDirectory } from './safetensors';
 import { WeightCache, defaultFetch, loadWeights, type LoadReceipt } from './cache';
 import { resolveDeviceProfile, withLiveLimits } from './deviceProfile';
+import { planGatherSplit } from './tableSplit';
+import { PLE_CODES } from './execute';
+import type { GatherSliceRef } from './plan';
+import { PLE_GROUPS } from './kernels/layerGeometry';
 
 // ----------------------------------------------------------------------------- public types
 
@@ -204,6 +208,14 @@ interface LoadedState {
    * own way of saying a site is uncalibrated (quant.ts applySrq).
    */
   scalars: Map<string, number>;
+  /**
+   * Vocabulary ranges the PLE table is carried in, when this adapter's buffers are too small to
+   * hold its 1,174,405,120 bytes whole. Empty on every adapter that fits it, which is every one
+   * this project has measured except iOS, whose maxBufferSize is 1,073,741,824. Filled by the
+   * upload sink from tableSplit.ts's plan and handed to the executor, which turns each range into
+   * its own gather dispatch. See ENGINE-PERF 28.7 for what the absent split cost.
+   */
+  pleSlices: GatherSliceRef[];
   /** The union of every stop set the checkpoint's files name. See `unionStopTokens`. */
   stopTokenIds: readonly number[];
   /**
@@ -216,6 +228,63 @@ interface LoadedState {
 }
 
 export class Gemma4Mobile {
+  /**
+   * Plan and declare the PLE table's split, if this adapter needs one, before its first byte lands.
+   *
+   * THE FACT THIS EXISTS FOR. The table is [262144, 8960] at 4 bits, which is 1,174,405,120 bytes.
+   * iOS grants a `maxBufferSize` of 1,073,741,824, and WebGPU does not throw on an oversized
+   * `createBuffer`: it hands back an invalid buffer, every write into it fails the same silent way,
+   * and the load reports success with the table empty. That is exactly what every iPhone did, and
+   * the model emitted fluent garbage rather than failing (ENGINE-PERF 28.7).
+   *
+   * The split is by vocabulary row so that a gather still reads one row out of one buffer, and the
+   * gather runs once per slice with the slice's row range in its uniform (./tableSplit.ts). At iOS's
+   * 1 GiB the plan is two slices, so the cost is one extra dispatch per gather per forward, and on
+   * every adapter that fits the table this function plans one slice, declares nothing, and the engine
+   * runs the plan it has always run.
+   *
+   * The geometry comes off the checkpoint's own header rather than from `arch`, because a split
+   * planned from a constant is a split a revision bump can silently invalidate.
+   */
+  private declarePleSplit(entry: { shape: readonly number[]; byteLength: number }): void {
+    const buffers = this.state.buffers;
+    const gpu = this.state.gpu;
+    if (!buffers || !gpu || buffers.isSplit(PLE_CODES)) return;
+    const rows = entry.shape[0] ?? 0;
+    if (rows <= 0 || entry.byteLength % rows !== 0) {
+      throw new Error(
+        `gemma4 engine: ${PLE_CODES} has shape [${entry.shape.join(', ')}] and ${entry.byteLength} `
+        + 'bytes, which is not a whole number of bytes per vocabulary row, so its split cannot be '
+        + 'planned. A table that cannot be split cannot be loaded on an adapter that needs one.',
+      );
+    }
+    const rowBytes = entry.byteLength / rows;
+    const plans = planGatherSplit(PLE_CODES, rows, rowBytes, PLE_GROUPS, {
+      maxStorageBufferBindingSize: gpu.limits.maxStorageBufferBindingSize,
+      maxBufferSize: gpu.limits.maxBufferSize,
+      maxStorageBuffersPerShaderStage: gpu.limits.maxStorageBuffersPerShaderStage,
+    });
+    // One slice is the whole table in one buffer, which is the fast path and the only path this
+    // engine had before. Declaring nothing is what keeps it byte for byte what it was.
+    if (plans.codes.single) return;
+    if (!plans.codes.feasible) throw new Error(`gemma4 engine: ${plans.codes.note}`);
+    // The sliced shader indexes the scales by the absolute vocabulary row, so a split scale table
+    // would read past the end of a slice and quietly return wrong numbers. No adapter reports a limit
+    // small enough to reach this, and it is refused rather than assumed away.
+    if (!plans.scalesSingle) throw new Error(`gemma4 engine: ${plans.note}`);
+    buffers.declareSplit(PLE_CODES, plans.codes.slices.map((slice) => ({
+      index: slice.index,
+      byteOffset: slice.byteOffset,
+      byteLength: slice.byteLength,
+    })));
+    this.state.pleSlices = plans.codes.slices.map((slice) => ({
+      index: slice.index,
+      startRow: slice.startRow,
+      rowCount: slice.rowCount,
+    }));
+    console.warn(`gemma4 engine: ${plans.codes.note}`);
+  }
+
   static readonly DEFAULT_MODEL_ID: string = DEFAULT_MODEL_ID;
 
   private readonly state: LoadedState;
@@ -309,6 +378,7 @@ export class Gemma4Mobile {
       buffers: new BufferManager(asDeviceLike(gpu.device), { maxBufferSize: gpu.limits.maxBufferSize }),
       cache,
       scalars: new Map<string, number>(),
+      pleSlices: [],
       stopTokenIds,
       loadReceipt: null,
     });
@@ -372,6 +442,12 @@ export class Gemma4Mobile {
         // scalar, so the widening below never sees a partial tensor; it is offset anyway, because a
         // widened offset is the source offset doubled and nothing else, and a rule that holds by
         // arithmetic is worth more than a rule that holds by which tensors happen to be big.
+        // Before this tensor's first byte reaches a buffer: if it does not fit in one buffer on
+        // this adapter, declare the split now so every piece is routed into a slice. This is here
+        // rather than beside the BufferManager's construction because the tensor's true byte length
+        // comes off the checkpoint's own header, and a split planned from a constant would be a
+        // split that a revision bump could silently invalidate.
+        if (name === PLE_CODES) engine.declarePleSplit(entry);
         const scalar = readScalarTensor(entry.dtype, entry.elementCount, bytes);
         if (scalar !== null) {
           engine.state.scalars.set(name, scalar);
@@ -520,6 +596,7 @@ export class Gemma4Mobile {
       arch: this.state.arch,
       kvLayout: this.kvLayout,
       maxChunkTokens: DEFAULT_PREFILL_CHUNK,
+      pleSlices: this.state.pleSlices,
     });
     // Compiling the decode set is what makes the first real token not the slow one, and it now
     // goes through the executor because a pipeline needs the bind group layout its kernel declares
@@ -527,7 +604,7 @@ export class Gemma4Mobile {
     // and it checks each kernel's storage binding count against the adapter's limit of 10
     // (ENGINE-PLAN risk 6), which is a check that could only ever run here.
     await executor.prepare(
-      planDecodeStep(this.state.arch),
+      planDecodeStep(this.state.arch, this.state.pleSlices),
       {
         arch: this.state.arch,
         mode: 'gemv',

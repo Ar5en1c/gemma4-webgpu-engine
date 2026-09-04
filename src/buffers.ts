@@ -39,6 +39,9 @@ export const USAGE = Object.freeze({
  */
 export const UNIFORM_OFFSET_ALIGN = 256;
 
+/** Shared zero length payload, so allocating a slice a piece did not reach costs no garbage. */
+const EMPTY_PIECE = new Uint8Array(0);
+
 /** Round `value` up to a multiple of `align`, which must be a positive power of two. */
 export function alignTo(value: number, align: number): number {
   if (!Number.isInteger(value) || value < 0) throw new Error(`alignTo: bad value ${value}`);
@@ -141,6 +144,24 @@ export class ArenaPlan {
 
 // ------------------------------------------------------------------------ buffer manager
 
+/**
+ * One contiguous byte range of a tensor that is carried in its own buffer.
+ *
+ * This is the byte shaped half of ../tableSplit.ts's `TableSlice`: the planner works in vocabulary
+ * rows because that is what makes a gather addressable, and the buffer manager works in bytes
+ * because that is what a piece of a download is. The two are the same partition.
+ */
+export interface WeightSliceRange {
+  readonly index: number;
+  readonly byteOffset: number;
+  readonly byteLength: number;
+}
+
+/** The name slice `index` of tensor `name` is resident under. One function, so nothing can disagree. */
+export function sliceName(name: string, index: number): string {
+  return `${name}#${index}`;
+}
+
 export interface UniformSlice {
   buffer: BufferLike;
   offset: number;
@@ -184,6 +205,14 @@ export class BufferManager {
   private readonly weights = new Map<string, BufferLike>();
   /** Tensors delivered whole in one call, which is what the double upload guard is about. */
   private readonly wholeUploads = new Set<string>();
+  /**
+   * Tensors that have received at least one byte. The double upload guard used to read "this name
+   * has a buffer", which meant the same thing until `declareSplit` began allocating a split
+   * tensor's slices before any of its bytes arrive. Now a slice buffer can exist and be empty, and
+   * a piece that happens to cover one whole slice is an ordinary first write rather than a second
+   * upload, so the guard asks what was written instead of what was allocated.
+   */
+  private readonly written = new Set<string>();
   private readonly pairs = new Map<string, { buffers: [BufferLike, BufferLike]; active: 0 | 1 }>();
   private readonly slots = new Map<string, BufferLike>();
   private readonly bufferIds = new Map<BufferLike, number>();
@@ -223,6 +252,72 @@ export class BufferManager {
   /** Zero means the caller did not say, and the guard below stands down. */
   private readonly maxBufferSize: number;
 
+  /**
+   * Tensors carried as several buffers because no one buffer on this adapter is large enough.
+   * Keyed by the tensor's checkpoint name; the buffers live in `weights` under `sliceName`.
+   *
+   * Empty on every adapter that grants a limit larger than the biggest tensor, which is every
+   * desktop adapter this project has measured, and non empty on iOS, where `maxBufferSize` is
+   * 1,073,741,824 and the PLE table is 1,174,405,120. See ../tableSplit.ts for why the split is by
+   * vocabulary row and ENGINE-PERF 28.7 for what the missing split cost.
+   */
+  private readonly splits = new Map<string, readonly WeightSliceRange[]>();
+
+  /**
+   * Declare that one tensor arrives as several buffers, before any of its bytes do.
+   *
+   * The ranges partition the tensor and are given in offset order; `uploadWeight` then routes each
+   * incoming piece into whichever slices it covers, rebasing the offset, and splitting a piece that
+   * straddles a boundary. The loader is unchanged by this: it keeps fetching and delivering pieces
+   * of the whole tensor and never learns that the destination is more than one buffer.
+   */
+  declareSplit(name: string, ranges: readonly WeightSliceRange[]): void {
+    if (this.weights.has(name) || this.splits.has(name)) {
+      throw new Error(`BufferManager.declareSplit: ${name} is already declared or resident`);
+    }
+    if (ranges.length === 0) throw new Error(`BufferManager.declareSplit: ${name} needs at least one range`);
+    let expect = 0;
+    for (const r of ranges) {
+      if (r.byteOffset !== expect) {
+        throw new Error(
+          `BufferManager.declareSplit: ${name} slice ${r.index} starts at ${r.byteOffset}, not at `
+          + `${expect}; the ranges have to partition the tensor in offset order`,
+        );
+      }
+      if (r.byteOffset % 4 !== 0) {
+        throw new Error(`BufferManager.declareSplit: ${name} slice ${r.index} starts at ${r.byteOffset}, which is not four byte aligned`);
+      }
+      if (this.maxBufferSize > 0 && r.byteLength > this.maxBufferSize) {
+        throw new Error(
+          `BufferManager.declareSplit: ${name} slice ${r.index} is ${r.byteLength} bytes against a `
+          + `maxBufferSize of ${this.maxBufferSize}, so the split does not go far enough`,
+        );
+      }
+      expect += r.byteLength;
+    }
+    this.splits.set(name, ranges.map((r) => ({ ...r })));
+    // Allocate every slice now, at its full length, rather than on the piece that first reaches it.
+    // Two reasons, and the second is the one a test found. A tensor whose last pieces all land in
+    // earlier slices would otherwise leave a tail slice with no buffer at all, which a kernel would
+    // meet as a missing tensor at the first dispatch. And allocating lazily meant the router had to
+    // visit slices a piece did not touch, which made a slice that one piece happened to cover whole
+    // look like the double upload the guard below refuses. Allocating here makes the router pure:
+    // it writes intersections and never creates anything.
+    for (const r of ranges) {
+      this.uploadOneBuffer(sliceName(name, r.index), EMPTY_PIECE, { offset: 0, totalBytes: r.byteLength });
+    }
+  }
+
+  /** True when this tensor is carried as several buffers on this adapter. */
+  isSplit(name: string): boolean {
+    return this.splits.has(name);
+  }
+
+  /** The ranges `declareSplit` recorded, for a residency report or a check. */
+  splitOf(name: string): readonly WeightSliceRange[] | null {
+    return this.splits.get(name) ?? null;
+  }
+
   private idOf(buffer: BufferLike): number {
     let id = this.bufferIds.get(buffer);
     if (id === undefined) {
@@ -259,6 +354,63 @@ export class BufferManager {
     bytes: Uint8Array,
     options: { offset?: number; totalBytes?: number } = {},
   ): BufferLike {
+    const ranges = this.splits.get(name);
+    if (ranges) return this.uploadSplitWeight(name, ranges, bytes, options);
+    return this.uploadOneBuffer(name, bytes, options);
+  }
+
+  /**
+   * Route one piece of a split tensor into the slices it covers.
+   *
+   * A piece is a byte range of the whole tensor and a slice is another, so the intersection is the
+   * arithmetic and there is nothing else to it. A piece that lands inside one slice is one write;
+   * a piece that straddles a boundary is two, each rebased to its own buffer's offset. Both are
+   * four byte aligned, because `declareSplit` refuses a range that does not start on a word and the
+   * loader's piece offsets are multiples of the piece size (safetensors.ts `splitRangeIntoPieces`).
+   *
+   * Returns the buffer of the first slice this piece touched, so the signature is the one every
+   * caller already has. No caller uses the return value for a split tensor: the kernels reach the
+   * slices by `sliceName`, which is what the sliced gather binds one of per dispatch.
+   */
+  private uploadSplitWeight(
+    name: string,
+    ranges: readonly WeightSliceRange[],
+    bytes: Uint8Array,
+    options: { offset?: number; totalBytes?: number },
+  ): BufferLike {
+    const pieceStart = Math.max(0, Math.trunc(options.offset ?? 0));
+    const pieceEnd = pieceStart + bytes.byteLength;
+    let first: BufferLike | null = null;
+    for (const range of ranges) {
+      const rangeEnd = range.byteOffset + range.byteLength;
+      const from = Math.max(pieceStart, range.byteOffset);
+      const to = Math.min(pieceEnd, rangeEnd);
+      // Slices this piece does not reach are already allocated by declareSplit and have nothing to
+      // receive, so there is nothing to do for them here.
+      if (to <= from) continue;
+      const buffer = this.uploadOneBuffer(
+        sliceName(name, range.index),
+        bytes.subarray(from - pieceStart, to - pieceStart),
+        { offset: from - range.byteOffset, totalBytes: range.byteLength },
+      );
+      if (!first) first = buffer;
+    }
+    if (!first) {
+      // A piece outside every declared range is a partition that does not cover the tensor, which
+      // declareSplit's own ordering check should already have made impossible.
+      throw new Error(
+        `BufferManager.uploadWeight: ${name} piece [${pieceStart}, ${pieceEnd}) falls outside every `
+        + 'declared slice',
+      );
+    }
+    return first;
+  }
+
+  private uploadOneBuffer(
+    name: string,
+    bytes: Uint8Array,
+    options: { offset?: number; totalBytes?: number } = {},
+  ): BufferLike {
     const offset = Math.max(0, Math.trunc(options.offset ?? 0));
     const totalBytes = Math.max(offset + bytes.byteLength, Math.trunc(options.totalBytes ?? 0));
     if (offset % 4 !== 0) {
@@ -270,8 +422,8 @@ export class BufferManager {
     // tensor, against a tensor that already has a buffer. Pieces are allowed in any order and each
     // covers part of one, so the guard cannot be "this name has a buffer" any more without refusing
     // the second piece of every split tensor.
-    const coversWhole = offset === 0 && bytes.byteLength >= totalBytes;
-    if (buffer && (coversWhole || this.wholeUploads.has(name))) {
+    const coversWhole = offset === 0 && bytes.byteLength > 0 && bytes.byteLength >= totalBytes;
+    if ((coversWhole && this.written.has(name)) || this.wholeUploads.has(name)) {
       throw new Error(`BufferManager.uploadWeight: ${name} was already uploaded`);
     }
     if (buffer && buffer.size < offset + bytes.byteLength) {
@@ -285,8 +437,9 @@ export class BufferManager {
         `BufferManager.uploadWeight: ${name} needs ${size} bytes in one buffer and this device's `
         + `maxBufferSize is ${this.maxBufferSize}. WebGPU would return an invalid buffer here and `
         + 'every write into it would fail, so the tensor would be empty and the model would emit '
-        + 'garbage. This tensor has to be split across buffers (see tableSplit.ts, whose planner '
-        + 'is written and tested but not yet wired into allocation).',
+        + 'garbage. A tensor this large has to be declared with declareSplit before its bytes '
+        + 'arrive, which engine.ts does for the PLE table from tableSplit.ts\'s plan. Reaching '
+        + 'this message means a different tensor outgrew the adapter and nothing plans its split.',
       );
     }
     if (!buffer) {
@@ -306,6 +459,7 @@ export class BufferManager {
         payload.set(bytes);
       }
       this.device.queue.writeBuffer(buffer, offset, payload);
+      this.written.add(name);
     }
     if (coversWhole) this.wholeUploads.add(name);
     return buffer;
@@ -589,6 +743,8 @@ export class BufferManager {
     for (const buffer of this.weights.values()) buffer.destroy();
     this.weights.clear();
     this.wholeUploads.clear();
+    this.written.clear();
+    this.splits.clear();
     for (const entry of this.pairs.values()) {
       entry.buffers[0].destroy();
       entry.buffers[1].destroy();

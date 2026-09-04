@@ -50,6 +50,8 @@ import { kvRoleForLayer, type KvLayout } from './kv';
 import { FINAL_LOGIT_SOFTCAP } from './kernels/logitSoftcap';
 import { ARGMAX_ELEMS_PER_WORKGROUP } from './kernels/argmax';
 import { GEMV_WIDE_COLS } from './kernels/qgemvWide';
+import { PLE_GATHER_SLICED_NAME } from './kernels/embedGather';
+import { sliceName } from './buffers';
 
 // ------------------------------------------------------------------------------- buffer names
 
@@ -197,6 +199,13 @@ export const ROLE_NORM_GAIN: Readonly<Record<string, string>> = Object.freeze({
  */
 export const LM_HEAD_CODES = `${LM}.embed_tokens.embedding_quantized`;
 export const LM_HEAD_SCALES = `${LM}.embed_tokens.embedding_scale`;
+
+/**
+ * The PLE table's two tensors, named once so the loader's split and this file's gather cannot
+ * disagree about which tensor is the 1,174,405,120 byte one.
+ */
+export const PLE_CODES = `${LM}.embed_tokens_per_layer.embedding_quantized`;
+export const PLE_SCALES = `${LM}.embed_tokens_per_layer.embedding_scale`;
 
 // -------------------------------------------------------------------------------- slot sizing
 
@@ -423,12 +432,32 @@ export function resolveStep(step: DispatchStep, geometry: ForwardGeometry): Reso
         ids: idsRef(),
       }, residual(true), { slots: tokens }, { flipsResidual: true });
 
-    case 'per layer embedding gather':
+    case 'per layer embedding gather': {
+      const codesName = PLE_CODES;
+      // On an adapter with room for the whole 1,174,405,120 byte table this is the single step it
+      // has always been and this branch is not taken. Where the table is split, planEmbed has
+      // already emitted one step per vocabulary range, each carrying the range it serves, so this
+      // stays one step to one dispatch and the decode loop above never learns the difference.
+      const slice = step.gatherSlice;
+      if (slice) {
+        return make(PLE_GATHER_SLICED_NAME, {
+          codes: weight(sliceName(codesName, slice.index)),
+          // Scales stay one buffer and stay addressed by the absolute vocabulary row, which is what
+          // the sliced shader assumes and what tableSplit.ts's `scalesSingle` checks.
+          scales: weight(PLE_SCALES),
+          ids: idsRef(),
+        }, s('ple.identity'), {
+          slots: tokens,
+          sliceStartRow: slice.startRow,
+          sliceRowCount: slice.rowCount,
+        });
+      }
       return make('ple-gather-4bit', {
-        codes: weight(`${LM}.embed_tokens_per_layer.embedding_quantized`),
-        scales: weight(`${LM}.embed_tokens_per_layer.embedding_scale`),
+        codes: weight(codesName),
+        scales: weight(PLE_SCALES),
         ids: idsRef(),
       }, s('ple.identity'), { slots: tokens });
+    }
 
     case 'per_layer_model_projection': {
       // The context aware half of the per layer input, and the one unquantized linear a forward
