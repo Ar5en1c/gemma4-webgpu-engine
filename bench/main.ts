@@ -59,7 +59,12 @@ interface PromptResult {
   text: string;
 }
 
+declare const __BUILD_ID__: string;
+declare const __BUILD_AT__: string;
+
 interface Result {
+  /** Which build produced this. A pasted result with no build is a stale page. */
+  build: { id: string; at: string };
   /** FAILED means do not quote any number below it. See `failures`. */
   verdict: 'ok' | 'FAILED';
   failures: string[];
@@ -288,6 +293,7 @@ async function bench(adapterInfo: Record<string, unknown> | null): Promise<void>
       + `${loadBytes.totalBytes} bytes, so the weights are incomplete`);
   }
   result = {
+    build: { id: __BUILD_ID__, at: __BUILD_AT__ },
     verdict: failures.length === 0 ? 'ok' : 'FAILED',
     failures,
     measuredAt: new Date().toISOString(),
@@ -333,3 +339,11 @@ $('bench').addEventListener('click', () => { void bench(adapterInfo); });
 $('copy').addEventListener('click', () => {
   if (result) void navigator.clipboard.writeText(JSON.stringify(result, null, 2));
 });
+
+// The stamp, visible so a screenshot carries it as well as the JSON.
+{
+  const el = document.createElement('div');
+  el.style.cssText = 'color:var(--muted);font-size:12px;margin-top:.6rem';
+  el.textContent = `build ${__BUILD_ID__}, ${__BUILD_AT__}`;
+  document.querySelector('footer')?.appendChild(el);
+}
