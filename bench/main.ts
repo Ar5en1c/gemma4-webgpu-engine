@@ -370,3 +370,60 @@ $('copy').addEventListener('click', () => {
   el.textContent = `build ${__BUILD_ID__}, ${__BUILD_AT__}`;
   document.querySelector('footer')?.appendChild(el);
 }
+
+/**
+ * Refuse to run a stale copy of this page.
+ *
+ * index.html is cacheable and every asset it names is content hashed, so a browser holding an old
+ * index.html loads an old bundle that really is still on the server. Nothing errors. The page runs,
+ * reports a device result, and the result describes code that has since been replaced. Three rounds
+ * of iPhone reports were spent that way, one of them on an error message quoting a comment that no
+ * longer existed.
+ *
+ * build.json is written by the deploy workflow, is not hashed, and is fetched here with
+ * `cache: 'no-store'`, which bypasses the HTTP cache rather than merely revalidating. If it names a
+ * build other than the one compiled into this bundle, this page is stale and says so instead of
+ * pretending its numbers are about the current engine.
+ *
+ * Failure to fetch it is silence, not an alarm: the file is absent on a local dev server and on any
+ * copy of this page served from somewhere other than the deploy, and a warning that fires there
+ * would train the reader to ignore it.
+ */
+async function checkForStalePage(): Promise<void> {
+  let published: string;
+  try {
+    const res = await fetch(new URL('build.json', location.href), { cache: 'no-store' });
+    if (!res.ok) return;
+    published = String((await res.json()).build ?? '');
+  } catch {
+    return;
+  }
+  if (!published || published.startsWith(__BUILD_ID__)) return;
+
+  const bar = document.createElement('div');
+  bar.style.cssText = 'background:#7f1d1d;color:#fff;padding:.8rem 1rem;border-radius:8px;'
+    + 'margin:0 0 1rem;font-size:14px;line-height:1.5';
+  bar.innerHTML = '<strong>This page is a cached older copy.</strong><br>'
+    + `It is build <code>${escapeHtml(__BUILD_ID__)}</code>; the server is now serving `
+    + `<code>${escapeHtml(published.slice(0, 7))}</code>. Anything measured here describes code `
+    + 'that has been replaced. ';
+  const link = document.createElement('a');
+  // A URL the browser has no cache entry for, which is what actually forces a fresh index.html.
+  link.href = `${location.pathname}?v=${encodeURIComponent(published.slice(0, 7))}`;
+  link.textContent = 'Load the current build';
+  link.style.cssText = 'color:#fff;font-weight:600';
+  bar.appendChild(link);
+  document.body.prepend(bar);
+
+  // Refusing beats warning: a banner above the fold is still a banner someone scrolls past on a
+  // phone, and the whole failure mode here is a result that looks fine and is not.
+  for (const id of ['bench', 'profile']) {
+    const button = document.getElementById(id) as HTMLButtonElement | null;
+    if (button) {
+      button.disabled = true;
+      button.title = 'This page is stale. Load the current build first.';
+    }
+  }
+}
+
+void checkForStalePage();

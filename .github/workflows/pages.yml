@@ -28,6 +28,13 @@ jobs:
       - run: npx vite build
         env:
           PAGES_BASE: /gemma4-webgpu-engine/
+      # An unhashed marker naming the build this deploy published. The page fetches it with
+      # cache: no-store, which bypasses the HTTP cache, and compares it against the build id
+      # compiled into the bundle. index.html itself is cacheable and its asset names are hashed,
+      # so a stale index.html points at a real older bundle and loads without any error at all.
+      # That has already sent three rounds of device reports back describing code that was
+      # replaced, so the page now says so instead of running.
+      - run: echo "{\"build\":\"${GITHUB_SHA}\"}" > dist/build.json
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist
