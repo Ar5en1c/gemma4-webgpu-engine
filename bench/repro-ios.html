@@ -74,6 +74,17 @@ log('\n--- OUTPUT ---\n' + JSON.stringify(text));
 // store is not built until the first forward, so reading it earlier always answers null and says
 // nothing about which reduction actually ran.
 log('reduce path: ' + engine.reducePolicy());
+// What the engine is actually holding. Xenova's engine runs this model on an iPhone, so the device
+// is not the constraint and this number is the thing to compare.
+{
+  const r = engine.bufferStats();
+  const MiB = 1024 * 1024;
+  log('residency: ' + (r
+    ? `${(r.weightBytes / MiB).toFixed(0)} MiB of weights in ${r.weightBuffers} buffers, `
+      + `${(r.activationBytes / MiB).toFixed(0)} MiB of activations in ${r.activationBuffers} buffers, `
+      + `${((r.weightBytes + r.activationBytes) / MiB).toFixed(0)} MiB total`
+    : 'unavailable'));
+}
 log('\n--- device errors after generate ---\n' + JSON.stringify(engine.deviceErrors(), null, 1));
 log('\nDONE');
 </script>

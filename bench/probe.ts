@@ -83,7 +83,21 @@ export interface AllocResult {
   /** What the device SAYS it allows for one buffer, from its own limits. */
   maxBufferSizeMiB: number;
   largestSingleMiB: number;
+  /** Buffers the device HANDED OUT, which is not the same as memory it can hold. See below. */
   totalMiB: number;
+  /**
+   * Memory the device actually took writes into, chunk by chunk, before it refused or the page
+   * died. This is the number that predicts whether the model loads.
+   *
+   * `createBuffer` succeeding proves nothing on iOS: the handle comes back and the pages are
+   * committed lazily, on first write. So the granted ladder above happily reported thousands of
+   * megabytes on a device that is killed partway through the actual upload, which is a probe that
+   * says "this device can run the engine" and then watches the tab die. Writing to each chunk is
+   * what turns a promise into a measurement.
+   */
+  committedMiB: number;
+  /** True when the committing ladder stopped because the device refused, rather than finishing. */
+  committedRefused: boolean;
   neededSingleMiB: number;
   neededTotalMiB: number;
   fitsSingle: boolean;
@@ -96,10 +110,17 @@ export interface AllocResult {
  * roughly 2.1 GB resident, and its largest single tensor is the PLE table at about 1.17 GB, which
  * the engine splits when the adapter cannot bind it whole (src/tableSplit.ts).
  */
-export async function allocationLadder(device: GPUDevice): Promise<AllocResult> {
+export async function allocationLadder(
+  device: GPUDevice,
+  onChunk?: (aboutToCommitMiB: number) => void,
+): Promise<AllocResult> {
   const MiB = 1024 * 1024;
   const NEEDED_SINGLE = 128;   // after the table split, the largest binding the engine asks for
   const NEEDED_TOTAL = 2200;   // the whole resident set, approximately
+  const CHUNK = 128;           // MiB per rung, on both ladders
+  // One staging array, reused. Allocating a 128 MiB host array per chunk would measure the JS heap
+  // as much as the device, and on a phone it would be the thing that fails.
+  const stage = new Uint8Array(8 * MiB);
 
   const alive: GPUBuffer[] = [];
   // BOTH scopes. A size over `maxBufferSize` is a VALIDATION error, not an out of memory one, and
@@ -136,12 +157,34 @@ export async function allocationLadder(device: GPUDevice): Promise<AllocResult> 
     b?.destroy();
   }
 
-  // total, in 128 MiB chunks held at once
+  // Granted: buffers the device hands out and holds at once, without a byte written to them.
   let total = 0;
   for (let i = 0; i < 24; i += 1) {
-    const ok = await tryAlloc(128 * MiB);
+    const ok = await tryAlloc(CHUNK * MiB);
     if (!ok) break;
-    total += 128;
+    total += CHUNK;
+  }
+  for (const b of alive) b.destroy();
+  alive.length = 0;
+
+  // Committed: the same ladder, but every chunk is written end to end before the next is asked
+  // for, so the pages are really backed. onChunk is called BEFORE each rung, so a trail written by
+  // the caller names the rung that killed the page rather than the last one that survived.
+  let committed = 0;
+  let committedRefused = false;
+  for (let i = 0; i < 24; i += 1) {
+    onChunk?.(committed + CHUNK);
+    if (!(await tryAlloc(CHUNK * MiB))) { committedRefused = true; break; }
+    const buf = alive[alive.length - 1]!;
+    device.pushErrorScope('out-of-memory');
+    for (let off = 0; off < CHUNK * MiB; off += stage.byteLength) {
+      device.queue.writeBuffer(buf, off, stage);
+    }
+    // onSubmittedWorkDone is the only honest way to wait for the writes to land; without it the
+    // ladder measures how fast a queue accepts work, which every device is instantly good at.
+    await device.queue.onSubmittedWorkDone();
+    if (await device.popErrorScope()) { committedRefused = true; break; }
+    committed += CHUNK;
   }
   for (const b of alive) b.destroy();
   alive.length = 0;
@@ -152,12 +195,19 @@ export async function allocationLadder(device: GPUDevice): Promise<AllocResult> 
     totalMiB: total,
     neededSingleMiB: NEEDED_SINGLE,
     neededTotalMiB: NEEDED_TOTAL,
+    committedMiB: committed,
+    committedRefused,
     fitsSingle: largest >= NEEDED_SINGLE,
-    fitsTotal: total >= NEEDED_TOTAL,
-    // Creation granted is not residency proven: a device can accept a buffer and fail when the
-    // whole working set is live. Read this as an upper bound.
-    note: total >= NEEDED_TOTAL
-      ? 'this device can hold the model'
-      : `this device granted ${total} MiB of the roughly ${NEEDED_TOTAL} MiB the model needs`,
+    // The committed ladder decides this, not the granted one. A device that hands out buffers it
+    // cannot back is exactly the device this probe exists to catch.
+    fitsTotal: committed >= NEEDED_TOTAL,
+    note: committed >= NEEDED_TOTAL
+      ? `this device took writes into ${committed} MiB, enough for the model`
+      : `this device granted ${total} MiB of buffers but only took writes into ${committed} MiB of `
+        + `the roughly ${NEEDED_TOTAL} MiB the model needs`
+        + (total > committed
+          ? '. Buffer creation succeeding is not memory: the pages are committed on first write, '
+            + 'which is where it stopped.'
+          : ''),
   };
 }
