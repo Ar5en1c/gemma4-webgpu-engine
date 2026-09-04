@@ -835,6 +835,34 @@ export const POOL_SWEEP_SIZES: readonly number[] = Object.freeze([4, 5, 6, 7, 8]
  */
 export const DEFAULT_MAX_BYTES_IN_FLIGHT = 384 * 1024 * 1024;
 
+/**
+ * The loader's concurrency for a device, from the one signal that separates a phone from a desktop
+ * without guessing at a user agent: how large a buffer its adapter will grant.
+ *
+ * WHY THIS EXISTS. The pool holds whole response bodies on the JS heap, and the default budget is
+ * 384 MiB of them. On a desktop that is insurance against a slow CloudFront edge and costs nothing.
+ * On an iPhone it is 384 MiB of ArrayBuffers competing with the two gigabytes of weights going
+ * resident on the GPU, inside a WebContent process that Safari kills rather than throws from.
+ *
+ * AND IT IS NOT ONLY THE DOWNLOAD. `serveFromCache` runs inside this same pool, so a load served
+ * entirely from IndexedDB holds the same 384 MiB. That is the reported failure: the weights were
+ * already downloaded, and the load died reading them back.
+ *
+ * The discriminator is `maxBufferSize`. iOS grants 1 GiB, desktop adapters grant several. A device
+ * that caps a single buffer at a gigabyte is a device with a small memory budget, and that is a
+ * fact it reports about itself rather than a string we pattern match.
+ *
+ * The cost is throughput: one request at a time instead of six. A load that takes longer beats a
+ * tab that is killed, and this only applies to the devices that were failing outright.
+ */
+export function loaderConcurrencyFor(maxBufferSize: number): { poolSize: number; maxBytesInFlight: number } {
+  const constrained = maxBufferSize > 0 && maxBufferSize <= 1024 * 1024 * 1024;
+  if (!constrained) return { poolSize: DEFAULT_POOL_SIZE, maxBytesInFlight: DEFAULT_MAX_BYTES_IN_FLIGHT };
+  // One piece at a time. The pieces stay RANGE_PIECE_BYTES so a cache written by any other build
+  // still resumes: the piece is the resume unit and changing it would orphan every stored marker.
+  return { poolSize: 1, maxBytesInFlight: RANGE_PIECE_BYTES };
+}
+
 // ------------------------------------------------------------------------ cache aware fetching
 
 /**

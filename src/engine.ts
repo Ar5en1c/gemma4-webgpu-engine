@@ -36,7 +36,7 @@ import { GpuExecutor, asDeviceLike, type ExecutorResources, type ForwardExecutor
 import { bf16StaysPacked, bf16ToF32 } from './quant';
 import { Gemma4DeviceError, requestGemma4Device, type Gemma4Device } from './device';
 import { resolveUrl, type SafetensorsDirectory } from './safetensors';
-import { WeightCache, defaultFetch, loadWeights, type LoadReceipt } from './cache';
+import { WeightCache, defaultFetch, loadWeights, loaderConcurrencyFor, type LoadReceipt } from './cache';
 import { resolveDeviceProfile, withLiveLimits } from './deviceProfile';
 import { planGatherSplit } from './tableSplit';
 import { PLE_CODES } from './execute';
@@ -395,7 +395,13 @@ export class Gemma4Mobile {
     // 2-bit repack below must not fire until it is. See ENGINE-PERF section 28.5.
     const deliveredBytes = new Map<string, number>();
     let tensorCount = 0;
+    // How many response bodies may be on the heap at once. Scaled down on a device whose adapter
+    // caps a buffer at a gigabyte, because the pool's default 384 MiB of ArrayBuffers is what a
+    // phone cannot afford alongside two gigabytes going resident. See cache.ts.
+    const concurrency = loaderConcurrencyFor(gpu.limits.maxBufferSize);
     const receipt = await loadWeights({
+      poolSize: concurrency.poolSize,
+      maxBytesInFlight: concurrency.maxBytesInFlight,
       fileUrl: `${root}/model.safetensors`,
       repo: repo ?? root,
       revision,

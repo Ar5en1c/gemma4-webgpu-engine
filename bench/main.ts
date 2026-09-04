@@ -167,6 +167,32 @@ async function profile(): Promise<Record<string, unknown> | null> {
   ];
   for (const [k, v] of Object.entries(limits)) rows.push([k, String(v)]);
 
+  // Storage, before anything is downloaded. The weights are about 2 GB and the browser keeps them
+  // in IndexedDB, so an origin whose quota is already spent cannot load from cache and cannot
+  // refill it either. That reads from the outside as the page dying for no reason, and it is the
+  // first thing worth knowing on a phone.
+  let storage: { quota: number; usage: number; freeMB: number } | null = null;
+  try {
+    const est = await navigator.storage?.estimate?.();
+    if (est && typeof est.quota === 'number' && typeof est.usage === 'number') {
+      storage = {
+        quota: est.quota,
+        usage: est.usage,
+        freeMB: Math.round((est.quota - est.usage) / 1e6),
+      };
+      const needMB = 2100;
+      rows.push(['storage quota', `${Math.round(est.quota / 1e6)} MB`]);
+      rows.push(['storage used', `${Math.round(est.usage / 1e6)} MB`]);
+      rows.push([
+        'storage free',
+        `${storage.freeMB} MB${storage.freeMB < needMB ? `, short of the ${needMB} MB the weights need` : ''}`,
+      ]);
+    }
+  } catch {
+    /* no estimate on this browser, which is not a failure */
+  }
+  crumb('storage', storage ?? { available: false });
+
   out.innerHTML = `<div class="scroll"><table>${
     rows.map(([k, v]) => `<tr><th>${k}</th><td class="n">${escapeHtml(v)}</td></tr>`).join('')
   }</table></div>` + (canRun
