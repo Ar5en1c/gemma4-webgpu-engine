@@ -7,8 +7,11 @@
 const log = (s) => { document.body.textContent += s + '\n'; };
 
 const IOS = { maxBufferSize: 1073741824, maxStorageBufferBindingSize: 1073741824 };
+// ?clamp=0 runs the same page against the adapter's real limits, which is the control: the split
+// is what changed, and the machine it must not change anything on is the one that never needs it.
+const clamp = new URLSearchParams(location.search).get('clamp') !== '0';
 const realRequestAdapter = navigator.gpu.requestAdapter.bind(navigator.gpu);
-navigator.gpu.requestAdapter = async (opts) => {
+navigator.gpu.requestAdapter = clamp ? async (opts) => {
   const a = await realRequestAdapter(opts);
   if (!a) return a;
   const limits = new Proxy(a.limits, {
@@ -27,8 +30,10 @@ navigator.gpu.requestAdapter = async (opts) => {
       return typeof v === 'function' ? v.bind(t) : v;
     },
   });
-};
-log('adapter clamped to: ' + JSON.stringify(IOS) + ', subgroups hidden');
+} : realRequestAdapter;
+log(clamp
+  ? 'adapter clamped to: ' + JSON.stringify(IOS) + ', subgroups hidden'
+  : 'adapter NOT clamped: this device\'s real limits, subgroups as reported');
 
 // Correctness runs want the cache, because re-downloading two gigabytes to answer a question about
 // buffer routing proves nothing extra. The default stays uncached, which is what a device report
