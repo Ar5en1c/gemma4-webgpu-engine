@@ -855,6 +855,31 @@ export const DEFAULT_MAX_BYTES_IN_FLIGHT = 384 * 1024 * 1024;
  * The cost is throughput: one request at a time instead of six. A load that takes longer beats a
  * tab that is killed, and this only applies to the devices that were failing outright.
  */
+/**
+ * How many bytes may be handed to `queue.writeBuffer` before waiting for the GPU to catch up.
+ *
+ * THE FAILURE THIS FIXES, from a crash trail off an iPhone. `writeBuffer` is fire and forget: it
+ * copies into staging the implementation owns and returns, and nothing in the upload path ever
+ * waits. Reading weights back from IndexedDB runs at about 675 MB/s, far faster than the GPU
+ * consumes them, so the staging backlog grows without bound. The trail died at 1,479 MB of 2,109,
+ * six seconds into a cache read, having never once waited.
+ *
+ * A desktop absorbs that backlog and nobody notices. A phone is killed by it, which is why this
+ * looked like a memory ceiling and was not: the same device took writes into 2,688 MiB happily in
+ * the allocation ladder, because the ladder awaits `onSubmittedWorkDone` after every chunk and the
+ * loader awaited nothing. The ladder was accidentally the control that proved the point.
+ *
+ * The drain is a bound on work in flight, not a throttle. When the GPU is keeping up,
+ * `onSubmittedWorkDone` resolves immediately and this costs a microtask per interval.
+ */
+export function uploadDrainBytes(maxBufferSize: number): number {
+  const constrained = maxBufferSize > 0 && maxBufferSize <= 1024 * 1024 * 1024;
+  // 128 MiB is the ladder's own chunk, which is the granularity this device is measured at.
+  // Desktops drain too, an order of magnitude less often, because an unbounded queue is a bug
+  // everywhere and only fatal on some machines.
+  return constrained ? 128 * 1024 * 1024 : 1024 * 1024 * 1024;
+}
+
 export function loaderConcurrencyFor(maxBufferSize: number): { poolSize: number; maxBytesInFlight: number } {
   const constrained = maxBufferSize > 0 && maxBufferSize <= 1024 * 1024 * 1024;
   if (!constrained) return { poolSize: DEFAULT_POOL_SIZE, maxBytesInFlight: DEFAULT_MAX_BYTES_IN_FLIGHT };
