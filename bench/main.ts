@@ -72,7 +72,7 @@ interface Result {
   userAgent: string;
   modelId: string;
   adapter: unknown;
-  device: unknown;
+  device: unknown | null;
   loadSeconds: number;
   maxNewTokens: number;
   reducePolicy: string | null;
@@ -226,7 +226,30 @@ async function bench(adapterInfo: Record<string, unknown> | null): Promise<void>
       },
     });
   } catch (err) {
-    out.innerHTML = `<p class="bad">Load failed: ${escapeHtml(String(err))}</p>`;
+    // A refused load is the most informative result this page can produce, so it must be
+    // pasteable. Before this, the guard fired and the page handed back nothing to copy.
+    result = {
+      build: { id: __BUILD_ID__, at: __BUILD_AT__ },
+      verdict: 'FAILED',
+      failures: [`the model refused to load: ${String(err)}`],
+      measuredAt: new Date().toISOString(),
+      userAgent: navigator.userAgent,
+      modelId: DEFAULT_MODEL_ID,
+      adapter: adapterInfo,
+      device: null,
+      loadSeconds: Math.round(((performance.now() - t0) / 1000) * 10) / 10,
+      maxNewTokens: MAX_NEW_TOKENS,
+      reducePolicy: null,
+      gpu: { lostReason: null, errors: [] },
+      load: null,
+      smoke,
+      allocation: alloc,
+      prompts: [],
+    };
+    out.innerHTML = `<p class="bad"><strong>The model refused to load.</strong> This is a real `
+      + 'result, not a crash: press Copy result JSON and send it.</p>'
+      + `<pre>${escapeHtml(String(err))}</pre>`;
+    ($('copy') as HTMLButtonElement).disabled = false;
     btn.disabled = false;
     return;
   }
