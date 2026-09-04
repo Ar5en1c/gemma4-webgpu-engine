@@ -1,0 +1,52 @@
+<!doctype html><meta charset="utf-8"><title>iOS constraint repro</title>
+<body style="font:12px ui-monospace,monospace;padding:16px;white-space:pre-wrap"></body>
+<script type="module">
+// Reproduce the iPhone's device on this Mac by clamping what the adapter advertises, so the
+// engine requests the same limits it gets on iOS. Chrome on macOS prints full validation
+// messages; Chrome on iOS prints "Validation failure." and nothing else.
+const log = (s) => { document.body.textContent += s + '\n'; };
+
+const IOS = { maxBufferSize: 1073741824, maxStorageBufferBindingSize: 1073741824 };
+const realRequestAdapter = navigator.gpu.requestAdapter.bind(navigator.gpu);
+navigator.gpu.requestAdapter = async (opts) => {
+  const a = await realRequestAdapter(opts);
+  if (!a) return a;
+  const limits = new Proxy(a.limits, {
+    get(t, p) {
+      if (typeof p === 'string' && p in IOS) return Math.min(Number(t[p]), IOS[p]);
+      const v = t[p];
+      return typeof v === 'function' ? v.bind(t) : v;
+    },
+  });
+  const features = { has: (f) => (f === 'subgroups' ? false : a.features.has(f)) };
+  return new Proxy(a, {
+    get(t, p) {
+      if (p === 'limits') return limits;
+      if (p === 'features') return features;
+      const v = t[p];
+      return typeof v === 'function' ? v.bind(t) : v;
+    },
+  });
+};
+log('adapter clamped to: ' + JSON.stringify(IOS) + ', subgroups hidden');
+
+const { Gemma4Mobile } = await import('../src/index.ts');
+log('loading...');
+let engine;
+try {
+  engine = await Gemma4Mobile.load(null, {
+    cache: false,
+    onProgress: (p) => { if (p.fraction) document.title = (p.fraction * 100).toFixed(0) + '%'; },
+  });
+} catch (e) { log('LOAD THREW: ' + e); throw e; }
+log('loaded, reduce=' + engine.reducePolicy());
+log('device errors after load: ' + JSON.stringify(engine.deviceErrors(), null, 1));
+
+let text = '';
+try {
+  for await (const c of engine.generate([{ role: 'user', content: 'In one sentence, what is photosynthesis?' }], { maxNewTokens: 20 })) text = c.text;
+} catch (e) { log('GENERATE THREW: ' + e); }
+log('\n--- OUTPUT ---\n' + JSON.stringify(text));
+log('\n--- device errors after generate ---\n' + JSON.stringify(engine.deviceErrors(), null, 1));
+log('\nDONE');
+</script>
