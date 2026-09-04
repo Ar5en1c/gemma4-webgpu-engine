@@ -438,6 +438,7 @@ export class Gemma4Mobile {
    */
   async *generate(messages: Gemma4Message[], options: Gemma4GenerateOptions = {}): AsyncGenerator<Gemma4Chunk, void, void> {
     this.assertLive();
+    this.assertDeviceLive();
     const signal = options.signal ?? null;
     const isAborted = (): boolean => signal?.aborted === true;
     // Idempotent, so the ordinary path pays for it once. A caller that already called warmup()
@@ -561,6 +562,22 @@ export class Gemma4Mobile {
   }
 
   /** Drop the KV cache and the cached transcript. */
+  /**
+   * A lost device is not an error anywhere in WebGPU: every submit is accepted and none of it runs,
+   * every readback returns zeros, and a greedy loop happily yields maxNewTokens empty strings at
+   * thousands of tokens a second. That is worse than a crash, because it looks like a measurement.
+   * An iPhone reported exactly that (ENGINE-PERF 28.6), so generate() refuses to start on a dead
+   * device and says why.
+   */
+  private assertDeviceLive(): void {
+    const gpu = this.state.gpu;
+    if (gpu?.lostReason) {
+      throw new Gemma4DeviceError('device-lost',
+        `the GPU device was lost (${gpu.lostReason}); every dispatch since is a no op, so any `
+        + 'number measured after it is meaningless. Reload the page to get a new device.');
+    }
+  }
+
   reset(): void {
     this.kvState.reset();
   }
@@ -595,6 +612,17 @@ export class Gemma4Mobile {
    * the two kernel sets produced its tokens. Every other page under dev/ builds its own
    * PipelineStore and therefore already knows; this class builds its own and kept the answer.
    */
+  /**
+   * What the GPU has to say about itself: whether the device has been lost, and every uncaptured
+   * error since load. A lost device accepts submits and runs none of them, so a caller that reports
+   * timings MUST read this. See ENGINE-PERF 28.6.
+   */
+  deviceErrors(): { lostReason: string | null; errors: readonly string[] } {
+    const gpu = this.state.gpu;
+    if (!gpu) return { lostReason: null, errors: [] };
+    return { lostReason: gpu.lostReason, errors: [...gpu.errors] };
+  }
+
   reducePolicy(): ReduceVariant | null {
     return this.pipelines?.variant ?? null;
   }

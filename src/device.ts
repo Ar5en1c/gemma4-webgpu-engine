@@ -62,6 +62,13 @@ export interface Gemma4Device {
   limits: Gemma4DeviceLimits;
   /** Resolves if the device is ever lost. Read it, do not await it on the load path. */
   lost: Promise<GPUDeviceLostInfo>;
+  /**
+   * Set when `lost` resolves, so a caller can ask SYNCHRONOUSLY whether the device has died.
+   * A lost device silently accepts every submit and runs none of them, which is how an iPhone
+   * came to report 3705 tok/s on empty output (ENGINE-PERF 28.6). Anything that reports a
+   * measurement must read this first.
+   */
+  lostReason: string | null;
   /** Uncaptured GPU errors, newest last. A non empty list invalidates any number measured after it. */
   errors: string[];
   destroy(): void;
@@ -83,7 +90,7 @@ export interface Gemma4DeviceOptions {
 }
 
 export class Gemma4DeviceError extends Error {
-  readonly reason: 'no-webgpu' | 'no-adapter' | 'no-f16' | 'no-device';
+  readonly reason: 'no-webgpu' | 'no-adapter' | 'no-f16' | 'no-device' | 'device-lost';
   constructor(reason: Gemma4DeviceError['reason'], message: string) {
     super(message);
     this.name = 'Gemma4DeviceError';
@@ -214,7 +221,7 @@ export async function requestGemma4Device(options: Gemma4DeviceOptions = {}): Pr
     errors.push(`${detail.constructor.name}: ${detail.message}`);
   });
 
-  return {
+  const resolved: Gemma4Device = {
     adapter,
     device,
     info: readInfo(adapter),
@@ -225,9 +232,16 @@ export async function requestGemma4Device(options: Gemma4DeviceOptions = {}): Pr
     },
     limits: readLimits(device.limits),
     lost: device.lost,
+    lostReason: null,
     errors,
     destroy: () => device.destroy(),
   };
+  // Recorded rather than awaited: the load path must not block on a promise that resolves only on
+  // failure, but everything downstream needs to be able to ask without awaiting.
+  void device.lost.then((info) => {
+    resolved.lostReason = `${info.reason ?? 'unknown'}: ${info.message || 'no message'}`;
+  }).catch(() => { resolved.lostReason = 'unknown: the lost promise rejected'; });
+  return resolved;
 }
 
 export interface PipelineResult {
