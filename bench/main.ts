@@ -92,6 +92,15 @@ interface Result {
 }
 
 let result: Result | null = null;
+/**
+ * Whether the committing allocation ladder has run in this page load.
+ *
+ * It holds gigabytes of GPU buffers and then destroys them, and a driver is under no obligation to
+ * return that memory to the process promptly. Running a 2 GB model load straight afterwards, in the
+ * same process, measures the two together. The page says so rather than pretending they are
+ * independent, and the trail records it so a report can be read correctly.
+ */
+let ladderRan = false;
 let smoke: SmokeResult | null = null;
 let alloc: AllocResult | null = null;
 
@@ -123,7 +132,7 @@ function validate(rows: PromptResult[]): string[] {
 
 // ------------------------------------------------------------------ stage 1, the device profile
 
-async function profile(): Promise<Record<string, unknown> | null> {
+async function profile(options: { skipLadder?: boolean } = {}): Promise<Record<string, unknown> | null> {
   const out = $('profileOut');
   if (!navigator.gpu) {
     out.innerHTML = '<p class="bad">WebGPU is not available in this browser. '
@@ -238,7 +247,29 @@ async function profile(): Promise<Record<string, unknown> | null> {
   smoke = await smokeTest(device);
   crumb('smoke-test done', { computeOk: smoke.computeOk });
   // The committing rungs are the ones that can take the tab down, so each names itself first.
-  alloc = await allocationLadder(device, (mib) => crumb('commit', { mib }));
+  if (options.skipLadder) {
+    // Reuse what the ladder measured before the reload. Running it again here would hold gigabytes
+    // in the process that is about to attempt the load, which is the whole thing the reload avoids.
+    let carried: AllocResult | null = null;
+    try {
+      const raw = sessionStorage.getItem(CARRIED_ALLOC);
+      if (raw) carried = JSON.parse(raw) as AllocResult;
+    } catch {
+      carried = null;
+    }
+    if (carried) {
+      alloc = carried;
+      crumb('allocation carried over the reload', { committedMiB: carried.committedMiB });
+    } else {
+      // Nothing carried across, so measure rather than assume. This is the rarer path and it is
+      // better than reporting a ceiling nobody measured.
+      alloc = await allocationLadder(device, (mib) => crumb('commit', { mib }));
+      ladderRan = true;
+    }
+  } else {
+    alloc = await allocationLadder(device, (mib) => crumb('commit', { mib }));
+    ladderRan = true;
+  }
   crumb('allocation done', {
     grantedMiB: alloc.totalMiB, committedMiB: alloc.committedMiB, largestSingleMiB: alloc.largestSingleMiB,
   });
@@ -278,18 +309,32 @@ async function bench(adapterInfo: Record<string, unknown> | null): Promise<void>
   // Every tenth of the load, so a killed trail says how far the weights got and whether they were
   // arriving from the network or from the cache. Throttled because each crumb is a synchronous
   // localStorage write and the progress callback fires far more often than that.
-  let lastCrumbAt = -1;
-  crumb('load start');
+  // ONE COUNTER PER KIND. weightsEvent emits two kinds and they mean different things: on a 'bytes'
+  // event `loaded` is bytes, on a 'tensors' event it is a COUNT of tensors. Sharing a single tenth
+  // counter let the tensors events, which climb fast once the bytes are in, suppress the bytes
+  // events entirely. The first crash trail off a phone read "80 percent, 0 MB loaded", which was a
+  // tensor count divided by a million and told us nothing about how far the weights got.
+  const lastTenth: Record<string, number> = { bytes: -1, tensors: -1 };
+  crumb('load start', {
+    // The committing ladder holds gigabytes and frees them. Whether it ran in THIS page load, before
+    // this load, is context the next trail needs in order to be read honestly.
+    ladderRanThisPageLoad: ladderRan,
+  });
   try {
     engine = await Gemma4Mobile.load(null, {
       onProgress: (p: Gemma4Progress) => {
         if (typeof p.fraction === 'number') pg.value = p.fraction;
+        const kind = p.kind ?? 'bytes';
         const tenth = typeof p.fraction === 'number' ? Math.floor(p.fraction * 10) : -1;
-        if (tenth > lastCrumbAt) {
-          lastCrumbAt = tenth;
+        if (tenth > (lastTenth[kind] ?? -1)) {
+          lastTenth[kind] = tenth;
           crumb('load', {
+            kind,
             pct: tenth * 10,
-            loadedMB: typeof p.loaded === 'number' ? Math.round(p.loaded / 1e6) : null,
+            // Bytes on a bytes event, a tensor count on a tensors event, each named for what it is.
+            ...(kind === 'bytes'
+              ? { loadedMB: typeof p.loaded === 'number' ? Math.round(p.loaded / 1e6) : null }
+              : { tensors: p.loaded ?? null, ofTensors: p.total ?? null }),
             fromCache: p.fromCache ?? null,
             status: p.status,
           });
@@ -453,7 +498,7 @@ function escapeHtml(s: string): string {
 
 let adapterInfo: Record<string, unknown> | null = null;
 $('profile').addEventListener('click', () => { void profile().then((p) => { adapterInfo = p; }); });
-$('bench').addEventListener('click', () => { void bench(adapterInfo); });
+$('bench').addEventListener('click', () => { benchOrReload(); });
 $('copy').addEventListener('click', () => {
   if (result) void navigator.clipboard.writeText(JSON.stringify(result, null, 2));
 });
@@ -595,3 +640,57 @@ function recoverPreviousRun(): void {
 }
 
 recoverPreviousRun();
+
+/**
+ * Run the benchmark in a page that has not just held gigabytes.
+ *
+ * The committing ladder allocates up to a few gigabytes and destroys them, and a driver is under no
+ * obligation to hand that memory straight back. A 2 GB load immediately afterwards in the same
+ * process is measuring the pair, not the load, and on the phone that produced the first crash trail
+ * that is exactly the order that ran.
+ *
+ * So the button reloads first when the ladder has run, and the fresh page starts the benchmark on
+ * its own. The reload costs a second and removes a variable that no amount of instrumentation
+ * inside this process can see.
+ */
+const AUTOSTART = 'g4.autostartBench';
+/** The ladder's answer, carried across the reload so it does not have to be paid for twice. */
+const CARRIED_ALLOC = 'g4.alloc';
+
+function benchOrReload(): void {
+  if (!ladderRan) { void bench(adapterInfo); return; }
+  try {
+    sessionStorage.setItem(AUTOSTART, '1');
+    // Carry the ladder's result over, or the profile on the other side of the reload runs it again
+    // and the reload releases nothing. Verified the hard way: the first version of this reloaded
+    // and then re trod every rung before starting the load.
+    if (alloc) sessionStorage.setItem(CARRIED_ALLOC, JSON.stringify(alloc));
+  } catch {
+    // No session storage means no autostart, so run here rather than reloading into nothing.
+    void bench(adapterInfo);
+    return;
+  }
+  crumb('reloading before benchmark, to drop the ladder\'s memory');
+  location.reload();
+}
+
+function resumeBenchAfterReload(): void {
+  let armed = false;
+  try {
+    armed = sessionStorage.getItem(AUTOSTART) === '1';
+    if (armed) sessionStorage.removeItem(AUTOSTART);
+  } catch {
+    return;
+  }
+  if (!armed) return;
+  const out = $('benchOut');
+  out.innerHTML = '<p>Reloaded to release the memory ladder. Profiling, then starting the benchmark.</p>';
+  // The benchmark needs the adapter facts the profile collects, so run that first. It takes the
+  // cheap path: the ladder is what costs, and it has already answered.
+  void (async () => {
+    const info = await profile({ skipLadder: true });
+    void bench(info);
+  })();
+}
+
+resumeBenchAfterReload();

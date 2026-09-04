@@ -98,6 +98,11 @@ export interface AllocResult {
   committedMiB: number;
   /** True when the committing ladder stopped because the device refused, rather than finishing. */
   committedRefused: boolean;
+  /**
+   * True when the ladder stopped on its own after proving enough headroom. `committedMiB` is then a
+   * floor, not a ceiling: the device took at least that much and was not asked for more.
+   */
+  committedStoppedEarly: boolean;
   neededSingleMiB: number;
   neededTotalMiB: number;
   fitsSingle: boolean;
@@ -170,9 +175,17 @@ export async function allocationLadder(
   // Committed: the same ladder, but every chunk is written end to end before the next is asked
   // for, so the pages are really backed. onChunk is called BEFORE each rung, so a trail written by
   // the caller names the rung that killed the page rather than the last one that survived.
+  // Stop once there is clear headroom over what the model needs, rather than climbing until the
+  // device refuses. The question this ladder answers is "will 2.1 GB fit", not "where is the
+  // ceiling", and every extra rung is memory held in the same process that is about to try the
+  // real load. The first phone to run this committed every rung to the old cap of 3072 MiB and
+  // then died during the load, which is a ladder that took a bite out of the thing it was
+  // measuring.
+  const COMMIT_CEILING = NEEDED_TOTAL + 384;
+  const maxRungs = Math.ceil(COMMIT_CEILING / CHUNK);
   let committed = 0;
   let committedRefused = false;
-  for (let i = 0; i < 24; i += 1) {
+  for (let i = 0; i < maxRungs; i += 1) {
     onChunk?.(committed + CHUNK);
     if (!(await tryAlloc(CHUNK * MiB))) { committedRefused = true; break; }
     const buf = alive[alive.length - 1]!;
@@ -197,12 +210,14 @@ export async function allocationLadder(
     neededTotalMiB: NEEDED_TOTAL,
     committedMiB: committed,
     committedRefused,
+    /** True when the ladder stopped because it had proved enough, not because the device refused. */
+    committedStoppedEarly: !committedRefused && committed >= COMMIT_CEILING,
     fitsSingle: largest >= NEEDED_SINGLE,
     // The committed ladder decides this, not the granted one. A device that hands out buffers it
     // cannot back is exactly the device this probe exists to catch.
     fitsTotal: committed >= NEEDED_TOTAL,
     note: committed >= NEEDED_TOTAL
-      ? `this device took writes into ${committed} MiB, enough for the model`
+      ? `this device took writes into at least ${committed} MiB, enough for the model`
       : `this device granted ${total} MiB of buffers but only took writes into ${committed} MiB of `
         + `the roughly ${NEEDED_TOTAL} MiB the model needs`
         + (total > committed
