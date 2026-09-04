@@ -30,7 +30,7 @@ import {
   type Gemma4Arch,
   type ProgressEvent,
 } from './plan';
-import { BufferManager } from './buffers';
+import { BufferManager, type BufferManagerStats } from './buffers';
 import { PipelineStore, chooseReduceVariant, runSubgroupSelfTest, type ReduceVariant } from './pipeline';
 import { GpuExecutor, asDeviceLike, type ExecutorResources, type ForwardExecutor } from './runtime';
 import { bf16StaysPacked, bf16ToF32 } from './quant';
@@ -720,6 +720,19 @@ export class Gemma4Mobile {
     this.assertLive();
     if (!this.gpuExecutor) return null;
     return this.gpuExecutor.readSlot('logits.capped', this.state.arch.vocabSize);
+  }
+
+  /**
+   * What this engine is actually holding on the GPU: weight buffers and their bytes, activation
+   * buffers and theirs.
+   *
+   * Exposed because "it crashed on that device" is not a bug report and "it was holding 2,384 MiB
+   * when the device stopped at 1,536" is. An adapter's allocation ladder says what a device will
+   * grant; this says what the engine asked for, and only the two together say whether a device can
+   * run the model. Null before the buffer manager exists, which is before `load`.
+   */
+  bufferStats(): BufferManagerStats | null {
+    return this.state.buffers?.snapshotStats() ?? null;
   }
 
   deviceInfo(): Gemma4DeviceInfo {

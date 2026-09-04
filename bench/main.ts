@@ -5,8 +5,10 @@
 // measured here in the page, and the prompts are fixed so two devices can be compared.
 
 import { Gemma4Mobile, DEFAULT_MODEL_ID } from '../src/index';
+import { REQUESTED_LIMITS } from '../src/device';
 import type { Gemma4Message, Gemma4Progress } from '../src/index';
 import { smokeTest, allocationLadder, type SmokeResult, type AllocResult } from './probe';
+import { crumb, startTrail, endTrail, readTrail, clearTrail, trailIsUnfinished, type Crumb } from './trail';
 
 const $ = (id: string): HTMLElement => {
   const el = document.getElementById(id);
@@ -82,6 +84,10 @@ interface Result {
   load: { totalBytes: number; cachedBytes: number; fetchedBytes: number } | null;
   smoke: SmokeResult | null;
   allocation: AllocResult | null;
+  /** What this run did, step by step, so a run that dies mid load is still a report. See ./trail.ts. */
+  trail: Crumb[];
+  /** GPU bytes the engine actually held. Null when the load never got that far. */
+  residency?: unknown;
   prompts: PromptResult[];
 }
 
@@ -174,13 +180,30 @@ async function profile(): Promise<Record<string, unknown> | null> {
   out.insertAdjacentHTML('beforeend', '<p id="probing">Running GPU smoke test and allocation ladder...</p>');
   let device: GPUDevice | null = null;
   try {
-    device = await adapter.requestDevice({ requiredFeatures: ['shader-f16' as GPUFeatureName] });
+    // The SAME limits the engine asks for, not the defaults. A device requested with defaults gets
+    // a 256 MiB maxBufferSize on hardware that grants four gigabytes, so the ladder below was
+    // measuring the request rather than the machine and this page reported 256 MiB on an M1.
+    const requiredLimits: Record<string, number> = {};
+    const adapterLimits = adapter.limits as unknown as Record<string, number>;
+    for (const name of REQUESTED_LIMITS) {
+      if (adapterLimits[name] > 0) requiredLimits[name] = adapterLimits[name];
+    }
+    device = await adapter.requestDevice({
+      requiredFeatures: ['shader-f16' as GPUFeatureName],
+      requiredLimits,
+    });
   } catch (err) {
     $('probing').outerHTML = `<p class="bad">The adapter refused a device: ${escapeHtml(String(err))}</p>`;
     return { info, features, limits };
   }
+  crumb('smoke-test');
   smoke = await smokeTest(device);
-  alloc = await allocationLadder(device);
+  crumb('smoke-test done', { computeOk: smoke.computeOk });
+  // The committing rungs are the ones that can take the tab down, so each names itself first.
+  alloc = await allocationLadder(device, (mib) => crumb('commit', { mib }));
+  crumb('allocation done', {
+    grantedMiB: alloc.totalMiB, committedMiB: alloc.committedMiB, largestSingleMiB: alloc.largestSingleMiB,
+  });
   device.destroy();
 
   const memOk = alloc.fitsTotal && alloc.fitsSingle;
@@ -214,10 +237,25 @@ async function bench(adapterInfo: Record<string, unknown> | null): Promise<void>
 
   const t0 = performance.now();
   let engine: Gemma4Mobile;
+  // Every tenth of the load, so a killed trail says how far the weights got and whether they were
+  // arriving from the network or from the cache. Throttled because each crumb is a synchronous
+  // localStorage write and the progress callback fires far more often than that.
+  let lastCrumbAt = -1;
+  crumb('load start');
   try {
     engine = await Gemma4Mobile.load(null, {
       onProgress: (p: Gemma4Progress) => {
         if (typeof p.fraction === 'number') pg.value = p.fraction;
+        const tenth = typeof p.fraction === 'number' ? Math.floor(p.fraction * 10) : -1;
+        if (tenth > lastCrumbAt) {
+          lastCrumbAt = tenth;
+          crumb('load', {
+            pct: tenth * 10,
+            loadedMB: typeof p.loaded === 'number' ? Math.round(p.loaded / 1e6) : null,
+            fromCache: p.fromCache ?? null,
+            status: p.status,
+          });
+        }
         const mb = typeof p.loaded === 'number' && typeof p.total === 'number' && p.total > 0
           ? `${(p.loaded / 1e6).toFixed(0)} of ${(p.total / 1e6).toFixed(0)} MB`
           : '';
@@ -226,6 +264,7 @@ async function bench(adapterInfo: Record<string, unknown> | null): Promise<void>
       },
     });
   } catch (err) {
+    crumb('load failed', { error: String(err).slice(0, 200) });
     // A refused load is the most informative result this page can produce, so it must be
     // pasteable. Before this, the guard fired and the page handed back nothing to copy.
     result = {
@@ -245,7 +284,9 @@ async function bench(adapterInfo: Record<string, unknown> | null): Promise<void>
       smoke,
       allocation: alloc,
       prompts: [],
+      trail: readTrail(),
     };
+    endTrail();
     out.innerHTML = `<p class="bad"><strong>The model refused to load.</strong> This is a real `
       + 'result, not a crash: press Copy result JSON and send it.</p>'
       + `<pre>${escapeHtml(String(err))}</pre>`;
@@ -254,6 +295,16 @@ async function bench(adapterInfo: Record<string, unknown> | null): Promise<void>
     return;
   }
   const loadSeconds = (performance.now() - t0) / 1000;
+  // The weights are resident, but the executor is not built until the first forward: pipelines are
+  // compiled and the KV cache is allocated there. That is a second memory step, and on a device
+  // that barely fit the weights it is a likely place to die, so it gets its own crumb.
+  const residency = engine.bufferStats();
+  crumb('loaded', {
+    loadSeconds: Math.round(loadSeconds),
+    weightMiB: residency ? Math.round(residency.weightBytes / (1024 * 1024)) : null,
+    activationMiB: residency ? Math.round(residency.activationBytes / (1024 * 1024)) : null,
+    weightBuffers: residency?.weightBuffers ?? null,
+  });
 
   const results: PromptResult[] = [];
   out.innerHTML = `<p>Loaded in ${loadSeconds.toFixed(1)} s. Running ${PROMPTS.length} prompts, `
@@ -262,6 +313,7 @@ async function bench(adapterInfo: Record<string, unknown> | null): Promise<void>
 
   const hardFailures: string[] = [];
   for (const prompt of PROMPTS) {
+    crumb('prompt', { name: prompt.name });
     // Independent prompts, so the KV cache from the last one must not survive into this one.
     engine.reset();
     const messages: Gemma4Message[] = [{ role: 'user', content: prompt.text }];
@@ -331,8 +383,13 @@ async function bench(adapterInfo: Record<string, unknown> | null): Promise<void>
     load: loadBytes,
     smoke,
     allocation: alloc,
+    // What the engine held, against what the ladder said the device would grant. One number is
+    // meaningless without the other.
+    residency: engine.bufferStats(),
     prompts: results,
+    trail: readTrail(),
   };
+  endTrail();
   const banner = failures.length === 0
     ? '<p class="ok"><strong>Run valid.</strong> These numbers are reportable.</p>'
     : '<p class="bad"><strong>RUN FAILED. Do not quote these numbers.</strong></p><ul class="bad">'
@@ -427,3 +484,50 @@ async function checkForStalePage(): Promise<void> {
 }
 
 void checkForStalePage();
+
+/**
+ * Show what a previous run was doing when this device stopped it.
+ *
+ * On iOS the page does not throw, it dies: Safari kills the WebContent process, shows "cannot open
+ * this page", and often reloads. Nothing survives except what was already written to disk. So the
+ * first thing this page does on load is read the last run's trail, and if that trail never reached
+ * its own end, put it on screen with a Copy button. A crash becomes a report.
+ *
+ * Read BEFORE the new trail starts, or this run overwrites the evidence it exists to recover.
+ */
+function recoverPreviousRun(): void {
+  const previous = readTrail();
+  if (trailIsUnfinished(previous)) {
+    const last = previous[previous.length - 1]!;
+    const panel = document.createElement('div');
+    panel.style.cssText = 'background:#78350f;color:#fff;padding:.8rem 1rem;border-radius:8px;'
+      + 'margin:0 0 1rem;font-size:14px;line-height:1.5';
+    panel.innerHTML = '<strong>The last run on this device stopped without finishing.</strong><br>'
+      + `It got as far as <code>${escapeHtml(String(last.phase))}</code> after `
+      + `${Math.round(Number(last.ms) / 1000)} s and never reached the end, which is what a killed `
+      + 'tab looks like from here. Press the button below and send the text.';
+    const button = document.createElement('button');
+    button.textContent = 'Copy crash trail';
+    button.style.cssText = 'margin-top:.6rem';
+    button.addEventListener('click', () => {
+      void navigator.clipboard.writeText(JSON.stringify({
+        build: { id: __BUILD_ID__, at: __BUILD_AT__ },
+        userAgent: navigator.userAgent,
+        note: 'the previous run on this device did not finish',
+        trail: previous,
+      }, null, 2));
+      button.textContent = 'Copied';
+    });
+    panel.appendChild(button);
+    document.body.prepend(panel);
+  }
+  clearTrail();
+  startTrail({
+    build: __BUILD_ID__,
+    userAgent: navigator.userAgent,
+    // A phone with the page already cached reports a different story from a cold one.
+    hardwareConcurrency: navigator.hardwareConcurrency ?? null,
+  });
+}
+
+recoverPreviousRun();

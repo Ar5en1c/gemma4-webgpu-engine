@@ -107,7 +107,7 @@ export class Gemma4DeviceError extends Error {
  * would have been read as a kernel bug rather than as a device configuration bug. Raise them once,
  * here, and no kernel author ever meets that failure.
  */
-const REQUESTED_LIMITS = [
+export const REQUESTED_LIMITS = [
   'maxStorageBuffersPerShaderStage',
   'maxStorageBufferBindingSize',
   'maxBufferSize',
