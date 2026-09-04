@@ -244,10 +244,27 @@ export class BufferManager {
    * PLE table (1,174,405,120 bytes) silently produced garbage on every device with a 1 GiB limit,
    * every iPhone among them, while the M1's 4 GiB limit hid it. See ENGINE-PERF 28.7.
    */
-  constructor(device: DeviceLike, limits?: { maxBufferSize?: number }) {
+  constructor(
+    device: DeviceLike,
+    limits?: {
+      maxBufferSize?: number;
+      /**
+       * Called for every weight buffer created at or above `minReportBytes`, with the running
+       * total. A load killed by the operating system throws nothing, so the only record of where it
+       * got is the one written before each allocation.
+       */
+      onAllocate?: (name: string, bytes: number, weightBytes: number) => void;
+      minReportBytes?: number;
+    },
+  ) {
     this.device = device;
     this.maxBufferSize = limits?.maxBufferSize ?? 0;
+    this.onAllocate = limits?.onAllocate;
+    this.minReportBytes = limits?.minReportBytes ?? 0;
   }
+
+  private readonly onAllocate?: (name: string, bytes: number, weightBytes: number) => void;
+  private readonly minReportBytes: number;
 
   /** Zero means the caller did not say, and the guard below stands down. */
   private readonly maxBufferSize: number;
@@ -451,6 +468,9 @@ export class BufferManager {
       this.weights.set(name, buffer);
       this.stats.weightBuffers += 1;
       this.stats.weightBytes += size;
+      if (this.onAllocate && size >= this.minReportBytes) {
+        this.onAllocate(name, size, this.stats.weightBytes);
+      }
     }
     if (bytes.byteLength > 0) {
       let payload = bytes;

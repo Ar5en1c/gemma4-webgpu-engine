@@ -7,7 +7,7 @@
 import { Gemma4Mobile, DEFAULT_MODEL_ID } from '../src/index';
 import { REQUESTED_LIMITS } from '../src/device';
 import type { Gemma4Message, Gemma4Progress } from '../src/index';
-import { smokeTest, allocationLadder, type SmokeResult, type AllocResult } from './probe';
+import { smokeTest, allocationLadder, hostMemoryLadder, type SmokeResult, type AllocResult } from './probe';
 import { crumb, startTrail, endTrail, readTrail, clearTrail, trailIsUnfinished, type Crumb } from './trail';
 
 const $ = (id: string): HTMLElement => {
@@ -322,6 +322,21 @@ async function bench(adapterInfo: Record<string, unknown> | null): Promise<void>
   });
   try {
     engine = await Gemma4Mobile.load(null, {
+      // Every buffer over 32 MiB, named, with the running GPU total, plus every wait for the GPU.
+      // A load the operating system kills throws nothing, so the last line written before the
+      // silence is the only evidence of what it was doing.
+      onDiagnostic: (d) => {
+        if (d.kind === 'drain') {
+          crumb('drain', { gpuMB: Math.round(d.weightBytes / 1e6) });
+          return;
+        }
+        crumb('alloc', {
+          // The tensor name's tail is the identifying half and the trail has a size budget.
+          name: String(d.name).replace(/^model\.language_model\./, ''),
+          MB: Math.round((d.bytes ?? 0) / 1e6),
+          gpuMB: Math.round(d.weightBytes / 1e6),
+        });
+      },
       onProgress: (p: Gemma4Progress) => {
         if (typeof p.fraction === 'number') pg.value = p.fraction;
         const kind = p.kind ?? 'bytes';
@@ -499,6 +514,27 @@ function escapeHtml(s: string): string {
 let adapterInfo: Record<string, unknown> | null = null;
 $('profile').addEventListener('click', () => { void profile().then((p) => { adapterInfo = p; }); });
 $('bench').addEventListener('click', () => { benchOrReload(); });
+
+// The host memory ceiling, which the GPU ladder cannot see. A phone that committed 2,688 MiB of
+// GPU buffers still died at about 1,479 MB of load, and so did an unrelated engine on the same
+// device. This says whether host and GPU share one budget, which decides whether a 2.1 GB resident
+// set can be made to fit here at all.
+$('hostmem').addEventListener('click', () => {
+  const btn = $('hostmem') as HTMLButtonElement;
+  btn.disabled = true;
+  const out = $('profileOut');
+  out.insertAdjacentHTML('beforeend', '<p id="hostmemOut">Holding host memory in 128 MiB steps...</p>');
+  void (async () => {
+    // Past what any tab is expected to give, so the ladder finds a ceiling rather than its own cap.
+    const res = await hostMemoryLadder(4096, (mib) => crumb('host-memory', { mib }));
+    crumb('host-memory done', { reachedMiB: res.reachedMiB, refused: res.refused });
+    $('hostmemOut').innerHTML = `<strong>Host memory:</strong> ${escapeHtml(res.note)}. `
+      + `GPU buffers reached ${alloc ? alloc.committedMiB : 'not measured'} MiB. `
+      + 'If this number is far below that one, the two do not share a budget and the load is '
+      + 'bounded by this one.';
+    btn.disabled = false;
+  })();
+});
 $('copy').addEventListener('click', () => {
   if (result) void navigator.clipboard.writeText(JSON.stringify(result, null, 2));
 });

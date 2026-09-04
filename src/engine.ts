@@ -80,6 +80,28 @@ export interface Gemma4LoadOptions {
   accessToken?: string;
   revision?: string;
   fetch?: typeof fetch;
+  /**
+   * Load time diagnostics: every GPU buffer allocation over `diagnosticBytes`, and every time the
+   * upload waits for the GPU to catch up.
+   *
+   * Exists because a load that is killed by the operating system leaves no exception and no stack,
+   * so the only way to learn where it died is to have said so before each step. A phone died at the
+   * same byte and the same tensor across two browsers and two builds, which is a specific
+   * allocation rather than a memory race, and nothing in the engine named it.
+   */
+  onDiagnostic?: (event: Gemma4LoadDiagnostic) => void;
+  /** Allocations smaller than this are not reported. Defaults to 32 MiB. */
+  diagnosticBytes?: number;
+}
+
+export interface Gemma4LoadDiagnostic {
+  kind: 'allocate' | 'drain';
+  /** Tensor name on an allocate. Absent on a drain. */
+  name?: string;
+  /** Bytes of this allocation. Absent on a drain. */
+  bytes?: number;
+  /** Weight bytes the buffer manager has allocated in total, after this event. */
+  weightBytes: number;
 }
 
 export interface Gemma4GenerateOptions {
@@ -375,7 +397,13 @@ export class Gemma4Mobile {
       // were actually fetched.
       directory: null,
       gpu,
-      buffers: new BufferManager(asDeviceLike(gpu.device), { maxBufferSize: gpu.limits.maxBufferSize }),
+      buffers: new BufferManager(asDeviceLike(gpu.device), {
+        maxBufferSize: gpu.limits.maxBufferSize,
+        minReportBytes: options.diagnosticBytes ?? 32 * 1024 * 1024,
+        onAllocate: options.onDiagnostic
+          ? (name, bytes, weightBytes) => options.onDiagnostic?.({ kind: 'allocate', name, bytes, weightBytes })
+          : undefined,
+      }),
       cache,
       scalars: new Map<string, number>(),
       pleSlices: [],
@@ -509,6 +537,10 @@ export class Gemma4Mobile {
         if (sinceDrain >= drainEvery) {
           sinceDrain = 0;
           await gpu.device.queue.onSubmittedWorkDone();
+          options.onDiagnostic?.({
+            kind: 'drain',
+            weightBytes: engine.state.buffers?.snapshotStats().weightBytes ?? 0,
+          });
         }
       },
     });

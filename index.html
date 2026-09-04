@@ -62,7 +62,11 @@
     <p class="lede" style="margin-bottom:.9rem">No download, a few seconds. It fills memory in
       steps to find where this device stops, so on a phone it may reload the tab. That is the
       answer, not a bug: the page will tell you where it stopped when it comes back.</p>
-    <div class="row"><button id="profile">Profile this device</button></div>
+    <div class="row"><button id="profile">Profile this device</button>
+      <button id="hostmem">Measure host memory</button></div>
+    <p class="lede" style="margin:.4rem 0 0">The second button answers a different question: the
+      profile measures GPU buffers, this measures ordinary memory. On a phone it is expected to end
+      the tab, and the number is written down before each step, so come back and copy the trail.</p>
     <div id="profileOut"></div>
   </section>
 
