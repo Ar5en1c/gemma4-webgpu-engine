@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gemma 4 WebGPU Engine</title>
+<style>
+  :root {
+    --paper: #fbfaf7; --panel: #ffffff; --ink: #1c2230; --muted: #5d6675;
+    --line: #e3e0d8; --accent: #c2551f; --ok: #1f7a4d; --bad: #b3261e;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper: #14171d; --panel: #1b1f27; --ink: #e8e6e1; --muted: #9aa3b2;
+      --line: #2b313c; --accent: #f08a4b; --ok: #4ec27f; --bad: #ef6f63;
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper: #14171d; --panel: #1b1f27; --ink: #e8e6e1; --muted: #9aa3b2;
+    --line: #2b313c; --accent: #f08a4b; --ok: #4ec27f; --bad: #ef6f63;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--paper); color: var(--ink);
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .wrap { max-width: 60rem; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+  h1 { font-size: 1.6rem; margin: 0 0 .35rem; letter-spacing: -.015em; text-wrap: balance; }
+  .lede { color: var(--muted); margin: 0 0 1.75rem; max-width: 44rem; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 1.1rem 1.25rem; margin-bottom: 1rem; }
+  h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .07em;
+    color: var(--muted); margin: 0 0 .8rem; font-weight: 600; }
+  button { font: inherit; font-weight: 600; background: var(--accent); color: #fff;
+    border: 0; border-radius: 7px; padding: .6rem 1.05rem; cursor: pointer; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.ghost { background: transparent; color: var(--ink); border: 1px solid var(--line); }
+  pre { font-family: var(--mono); font-size: 12.5px; line-height: 1.5; margin: 0;
+    white-space: pre-wrap; word-break: break-word; }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+  th, td { text-align: left; padding: .4rem .6rem .4rem 0; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; }
+  td.n { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .warn { border-left: 3px solid var(--accent); padding-left: .8rem; color: var(--muted);
+    font-size: 13.5px; margin: .7rem 0 1rem; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); }
+  .row { display: flex; gap: .6rem; flex-wrap: wrap; align-items: center; }
+  progress { width: 100%; height: 7px; }
+  footer { color: var(--muted); font-size: 13px; margin-top: 2rem; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Gemma 4 WebGPU Engine</h1>
+  <p class="lede">A clean-room inference engine for Gemma 4 E2B that runs entirely in your browser.
+  Nothing you type leaves this machine. This page profiles your GPU and, if you ask it to,
+  benchmarks the engine on it.</p>
+
+  <section>
+    <h2>1. Device profile</h2>
+    <p class="lede" style="margin-bottom:.9rem">Instant, no download. Safe to run on a phone.</p>
+    <div class="row"><button id="profile">Profile this device</button></div>
+    <div id="profileOut"></div>
+  </section>
+
+  <section>
+    <h2>2. Benchmark</h2>
+    <div class="warn">This downloads about <strong>2 GB</strong> of model weights from Hugging Face
+      on first run, then caches them in this browser. Do not start it on a metered connection.
+      It needs roughly 3 GB of free memory, so most phones will fail here.</div>
+    <div class="row">
+      <button id="bench" disabled>Run benchmark</button>
+      <button id="copy" class="ghost" disabled>Copy result JSON</button>
+    </div>
+    <div id="benchOut"></div>
+  </section>
+
+  <footer>
+    Apache-2.0. Weights are Google's Gemma 4, also Apache-2.0, fetched directly from Hugging Face.
+    <a href="https://github.com/Ar5en1c/gemma4-webgpu-engine">Source</a>.
+  </footer>
+</div>
+<script type="module" src="/bench/main.ts"></script>
+</body>
+</html>

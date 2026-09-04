@@ -1,0 +1,25 @@
+{
+  "name": "gemma4-webgpu-engine",
+  "version": "0.1.0",
+  "description": "A clean-room WebGPU inference engine for Google's Gemma 4 E2B, running entirely in the browser.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "files": [
+    "src",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "dev": "vite --port 5300 --strictPort",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --port 5300"
+  },
+  "devDependencies": {
+    "@webgpu/types": "^0.1.60",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.2"
+  }
+}
