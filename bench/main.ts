@@ -15,8 +15,16 @@ const $ = (id: string): HTMLElement => {
 };
 
 /** Fixed so two devices are comparable. Short, medium and long prefill, one generation length. */
-const PROMPTS: { name: string; text: string }[] = [
-  { name: 'short', text: 'In one sentence, what is photosynthesis?' },
+const PROMPTS: { name: string; text: string; expect?: string[] }[] = [
+  // `expect` is a coherence canary. A run that reports 44 tok/s on fluent nonsense passes a rate
+  // check and a non empty check; it does not pass this. The words are ones any correct answer to
+  // the prompt contains, matched case insensitively, and only the short prompt carries them
+  // because only a closed question has an answer you can assert on.
+  {
+    name: 'short',
+    text: 'In one sentence, what is photosynthesis?',
+    expect: ['photosynth', 'plant', 'light'],
+  },
   {
     name: 'medium',
     text:
@@ -42,6 +50,8 @@ const MAX_NEW_TOKENS = 64;
 
 interface PromptResult {
   name: string;
+  /** null when the prompt carries no canary. */
+  coherent: boolean | null;
   ttftMs: number;
   tokens: number;
   decodeTokPerSec: number;
@@ -88,6 +98,10 @@ function validate(rows: PromptResult[]): string[] {
         + `${PLAUSIBLE_MAX_TOK_PER_SEC} tok/s plausibility ceiling, so the work did not run`);
     }
     if (r.decodeTokPerSec <= 0) failures.push(`prompt "${r.name}" reported no decode rate`);
+    if (r.coherent === false) {
+      failures.push(`prompt "${r.name}" produced text that mentions none of its expected words, `
+        + 'so the engine is emitting fluent nonsense rather than an answer');
+    }
   }
   return failures;
 }
@@ -229,8 +243,11 @@ async function bench(adapterInfo: Record<string, unknown> | null): Promise<void>
     const ttftMs = firstAt - start;
     // Decode rate excludes the first token, which is prefill, so this is the steady state.
     const decodeTokPerSec = tokens > 1 ? ((tokens - 1) / ((end - firstAt) / 1000)) : 0;
+    const lower = text.toLowerCase();
+    const coherent = prompt.expect ? prompt.expect.some((w) => lower.includes(w)) : null;
     results.push({
       name: prompt.name,
+      coherent,
       ttftMs: Math.round(ttftMs),
       tokens,
       decodeTokPerSec: Math.round(decodeTokPerSec * 100) / 100,

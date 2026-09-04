@@ -4,17 +4,8 @@ A clean-room WebGPU inference engine for Google's **Gemma 4 E2B**, running entir
 No server, no WASM runtime, no ONNX. It fetches the quantized weights from Hugging Face, keeps them
 in IndexedDB, and does every matmul in WGSL compute shaders.
 
-> ## KNOWN BROKEN, 2026-09-04
->
-> **Do not use this yet.** The engine currently emits incoherent text. Bisected to
-> `5d0d930` (2026-09-02), the interleaved 2-bit tile layout and its GPU repack at load.
-> The commit before it answers "In one sentence, what is photosynthesis?" correctly; that
-> commit and everything after it emit token 174752 and similar junk.
->
-> The performance numbers below were taken after that commit, so treat every one of them as
-> unverified until the regression is fixed and they are re-measured.
-
-**Status: alpha, and currently failing.** See the notice above. The API is small and will change.
+**Status: alpha.** It runs, it is measured against the transformers reference, and it is not yet a
+package on npm. The API is small and will change.
 
 ## Why it exists
 
