@@ -9,7 +9,13 @@ const log = (s) => { document.body.textContent += s + '\n'; };
 const IOS = { maxBufferSize: 1073741824, maxStorageBufferBindingSize: 1073741824 };
 // ?clamp=0 runs the same page against the adapter's real limits, which is the control: the split
 // is what changed, and the machine it must not change anything on is the one that never needs it.
-const clamp = new URLSearchParams(location.search).get('clamp') !== '0';
+const params = new URLSearchParams(location.search);
+const clamp = params.get('clamp') !== '0';
+// iOS reports no subgroups, so the clamp hides them too and the engine takes the workgroup reduce.
+// That makes a clamped run differ from an unclamped one in TWO ways at once, and only one of them
+// is the split. ?subgroups=1 keeps the limits clamped and leaves subgroups alone, which is the run
+// that isolates the split: same reduce path, same prompt, one buffer against two.
+const hideSubgroups = params.get('subgroups') !== '1';
 const realRequestAdapter = navigator.gpu.requestAdapter.bind(navigator.gpu);
 navigator.gpu.requestAdapter = clamp ? async (opts) => {
   const a = await realRequestAdapter(opts);
@@ -25,15 +31,16 @@ navigator.gpu.requestAdapter = clamp ? async (opts) => {
   return new Proxy(a, {
     get(t, p) {
       if (p === 'limits') return limits;
-      if (p === 'features') return features;
+      if (p === 'features' && hideSubgroups) return features;
       const v = t[p];
       return typeof v === 'function' ? v.bind(t) : v;
     },
   });
 } : realRequestAdapter;
 log(clamp
-  ? 'adapter clamped to: ' + JSON.stringify(IOS) + ', subgroups hidden'
+  ? 'adapter clamped to: ' + JSON.stringify(IOS)
   : 'adapter NOT clamped: this device\'s real limits, subgroups as reported');
+if (clamp) log('subgroups: ' + (hideSubgroups ? 'hidden, as on iOS' : 'left as this adapter reports'));
 
 // Correctness runs want the cache, because re-downloading two gigabytes to answer a question about
 // buffer routing proves nothing extra. The default stays uncached, which is what a device report
@@ -55,7 +62,7 @@ try {
     onProgress: (p) => { if (p.fraction) document.title = (p.fraction * 100).toFixed(0) + '%'; },
   });
 } catch (e) { log('LOAD THREW: ' + e); throw e; }
-log('loaded, reduce=' + engine.reducePolicy());
+log('loaded');
 log('device errors after load: ' + JSON.stringify(engine.deviceErrors(), null, 1));
 
 let text = '';
@@ -63,6 +70,10 @@ try {
   for await (const c of engine.generate([{ role: 'user', content: 'In one sentence, what is photosynthesis?' }], { maxNewTokens: 20 })) text = c.text;
 } catch (e) { log('GENERATE THREW: ' + e); }
 log('\n--- OUTPUT ---\n' + JSON.stringify(text));
+// After the generate, not after the load: reducePolicy reads the pipeline store's variant and the
+// store is not built until the first forward, so reading it earlier always answers null and says
+// nothing about which reduction actually ran.
+log('reduce path: ' + engine.reducePolicy());
 log('\n--- device errors after generate ---\n' + JSON.stringify(engine.deviceErrors(), null, 1));
 log('\nDONE');
 </script>
