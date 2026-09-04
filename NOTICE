@@ -1,0 +1,11 @@
+Purrview Gemma 4 WebGPU engine
+Copyright 2026 Kuldeep Singh
+
+This directory is licensed under the Apache License, Version 2.0, inside a
+repository otherwise under the MIT License. See the LICENSE file beside this
+notice.
+
+Written as an independent implementation from Google's published Gemma 4
+architecture and configuration files, the safetensors format, the Hugging Face
+transformers reference implementation (Apache-2.0), and this project's own
+measurement record. It contains no code from any third-party inference engine.
