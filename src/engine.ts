@@ -36,7 +36,7 @@ import { GpuExecutor, asDeviceLike, type ExecutorResources, type ForwardExecutor
 import { bf16StaysPacked, bf16ToF32 } from './quant';
 import { Gemma4DeviceError, requestGemma4Device, type Gemma4Device } from './device';
 import { resolveUrl, type SafetensorsDirectory } from './safetensors';
-import { WeightCache, defaultFetch, loadWeights, loaderConcurrencyFor, type LoadReceipt } from './cache';
+import { WeightCache, defaultFetch, loadWeights, loaderConcurrencyFor, uploadDrainBytes, type LoadReceipt } from './cache';
 import { resolveDeviceProfile, withLiveLimits } from './deviceProfile';
 import { planGatherSplit } from './tableSplit';
 import { PLE_CODES } from './execute';
@@ -399,6 +399,10 @@ export class Gemma4Mobile {
     // caps a buffer at a gigabyte, because the pool's default 384 MiB of ArrayBuffers is what a
     // phone cannot afford alongside two gigabytes going resident. See cache.ts.
     const concurrency = loaderConcurrencyFor(gpu.limits.maxBufferSize);
+    // Bytes the upload may run ahead of the GPU by before it waits. Zero waiting is what killed
+    // every phone that got past the buffer guard.
+    const drainEvery = uploadDrainBytes(gpu.limits.maxBufferSize);
+    let sinceDrain = 0;
     const receipt = await loadWeights({
       poolSize: concurrency.poolSize,
       maxBytesInFlight: concurrency.maxBytesInFlight,
@@ -429,7 +433,7 @@ export class Gemma4Mobile {
         emit(openingWeightsEvent(info.totalBytes));
       },
       onBytes: (loaded, total, fromCache) => emit(weightsEvent('bytes', loaded, total, fromCache)),
-      sink: (name, entry, bytes, offset) => {
+      sink: async (name, entry, bytes, offset) => {
         // Upload straight to the GPU, packed. Nothing quantized is dequantized on the CPU
         // (ENGINE-PLAN section 3), and nothing is retained on the JS heap. Two narrow exceptions,
         // both about storage rather than about quantization:
@@ -496,6 +500,15 @@ export class Gemma4Mobile {
           }
           uploaded += 1;
           emit(weightsEvent('tensors', uploaded, tensorCount));
+        }
+        // BACKPRESSURE. queue.writeBuffer returns as soon as it has copied into staging the
+        // implementation owns, so without this the loader hands the GPU two gigabytes as fast as
+        // IndexedDB can produce them and the staging backlog grows without bound. See
+        // cache.ts uploadDrainBytes for the trail that showed it.
+        sinceDrain += bytes.byteLength;
+        if (sinceDrain >= drainEvery) {
+          sinceDrain = 0;
+          await gpu.device.queue.onSubmittedWorkDone();
         }
       },
     });
