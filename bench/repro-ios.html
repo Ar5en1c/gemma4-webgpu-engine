@@ -55,10 +55,18 @@ console.warn = (...a) => { log('warn: ' + a.join(' ')); realWarn(...a); };
 
 const { Gemma4Mobile } = await import('../src/index.ts');
 log('loading...');
+const allocLog = [];
 let engine;
 try {
   engine = await Gemma4Mobile.load(null, {
     cache: useCache,
+    // Every buffer over 32 MiB, named, with the running GPU total. This is the sequence a phone
+    // dies partway through, so seeing it whole on a machine that survives says what the phone was
+    // about to do.
+    onDiagnostic: (d) => {
+      if (d.kind === 'drain') { allocLog.push(`drain at ${Math.round(d.weightBytes / 1e6)} MB`); return; }
+      allocLog.push(`${Math.round((d.bytes ?? 0) / 1e6)} MB -> ${Math.round(d.weightBytes / 1e6)} MB  ${String(d.name).replace(/^model\.language_model\./, '')}`);
+    },
     onProgress: (p) => { if (p.fraction) document.title = (p.fraction * 100).toFixed(0) + '%'; },
   });
 } catch (e) { log('LOAD THREW: ' + e); throw e; }
@@ -79,6 +87,7 @@ log('reduce path: ' + engine.reducePolicy());
 {
   const r = engine.bufferStats();
   const MiB = 1024 * 1024;
+  log('\n--- allocations over 32 MiB, in order ---\n' + allocLog.join('\n'));
   log('residency: ' + (r
     ? `${(r.weightBytes / MiB).toFixed(0)} MiB of weights in ${r.weightBuffers} buffers, `
       + `${(r.activationBytes / MiB).toFixed(0)} MiB of activations in ${r.activationBuffers} buffers, `

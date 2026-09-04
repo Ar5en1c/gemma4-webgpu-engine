@@ -61,7 +61,31 @@ export interface TableSplitInput {
   readonly maxBufferSize: number;
   /** `adapter.limits.maxStorageBuffersPerShaderStage`, risk 6's number. */
   readonly maxStorageBuffersPerShaderStage: number;
+  /**
+   * Largest slice this planner will cut, once it has decided a split is needed at all. Defaults to
+   * `DEFAULT_MAX_SLICE_BYTES`.
+   *
+   * WHY A SLICE IS NOT SIMPLY AS LARGE AS THE LIMIT ALLOWS. The first version of this packed each
+   * slice to `min(maxStorageBufferBindingSize, maxBufferSize)`, which on iOS produced one buffer of
+   * 1,073,694,720 bytes, forty seven kilobytes under that device's stated maximum. An adapter's
+   * advertised maximum is what it will validate, not what it can still find when a gigabyte and a
+   * half is already live, and a single allocation that large has to be backed contiguously. The
+   * instrumented load shows the whole table arriving as one 1,074 MB step at 300 MB resident, and
+   * the phone dying as the writes into it begin, at the same byte on two browsers and two builds.
+   *
+   * Smaller slices cost one gather dispatch each and ask the driver for something it can actually
+   * place. This is the same trade the header already accepted at nine slices on the specification
+   * floor.
+   */
+  readonly maxSliceBytes?: number;
 }
+
+/**
+ * The cap on one slice once a table has to be split, chosen to sit alongside the engine's other
+ * large weights rather than at the adapter's ceiling: the next biggest buffers this model allocates
+ * are `lm_head.weight` and `embed_tokens.embedding_quantized` at about 101 MB each.
+ */
+export const DEFAULT_MAX_SLICE_BYTES = 256 * 1024 * 1024;
 
 export interface TableSplitPlan {
   readonly name: string;
@@ -111,7 +135,15 @@ export function planTableSplit(input: TableSplitInput): TableSplitPlan {
   );
   const bindingBudget = Math.trunc(input.maxStorageBuffersPerShaderStage);
 
-  const rowsPerSlice = Math.floor(limitBytes / rowBytes);
+  // The whole table in one buffer stays exactly that, on every adapter with room for it. The cap
+  // below applies only once a split is unavoidable, so an adapter that never needed one is
+  // untouched by this and keeps the single buffer and the single dispatch it has always had.
+  const fitsWhole = totalBytes > 0 && totalBytes <= limitBytes;
+  const sliceCap = Math.max(
+    1,
+    Math.min(limitBytes, Math.trunc(input.maxSliceBytes ?? DEFAULT_MAX_SLICE_BYTES)),
+  );
+  const rowsPerSlice = Math.floor((fitsWhole ? limitBytes : sliceCap) / rowBytes);
   if (rowsPerSlice < 1) {
     return {
       name: input.name,

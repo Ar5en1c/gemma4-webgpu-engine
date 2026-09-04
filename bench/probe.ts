@@ -226,3 +226,63 @@ export async function allocationLadder(
           : ''),
   };
 }
+
+/**
+ * How much HOST memory this tab is given, measured the same way the GPU ladder measures the device.
+ *
+ * WHY THIS IS A SEPARATE NUMBER. The allocation ladder above measures GPU buffers, and on the phone
+ * that could not load the model it reached 2,688 MiB without complaint. The load then died at about
+ * 1,479 MB, and a second engine from a different project died at about the same figure on the same
+ * phone. Two engines failing at one number is a property of the platform, not of either engine, but
+ * "the tab has a budget" and "the tab has a budget for GPU buffers" are different claims and only
+ * one of them is consistent with a ladder that reached 2.7 GB.
+ *
+ * So this allocates ordinary ArrayBuffers and writes a byte to every page, which is what makes an
+ * allocation real rather than reserved, and reports where it stopped. Run against the GPU figure it
+ * says whether the two share one budget or hold separate ones, and that decides whether a 2.1 GB
+ * model can be made to fit here at all or whether the resident set has to come down.
+ *
+ * This is expected to end the tab on a phone. That is the measurement, and the caller writes a
+ * breadcrumb before each step so the number survives the process that produced it.
+ */
+export interface HostMemoryResult {
+  reachedMiB: number;
+  refused: boolean;
+  note: string;
+}
+
+export async function hostMemoryLadder(
+  ceilingMiB: number,
+  onChunk?: (aboutToHoldMiB: number) => void,
+): Promise<HostMemoryResult> {
+  const MiB = 1024 * 1024;
+  const CHUNK = 128;
+  const held: Uint8Array[] = [];
+  let reached = 0;
+  let refused = false;
+  for (let i = 0; i < Math.ceil(ceilingMiB / CHUNK); i += 1) {
+    onChunk?.(reached + CHUNK);
+    let block: Uint8Array;
+    try {
+      block = new Uint8Array(CHUNK * MiB);
+    } catch {
+      refused = true;
+      break;
+    }
+    // Touch every 4 KiB page. An untouched allocation can be a reservation the system never backs,
+    // which is the same mistake the GPU ladder made before it started writing to its buffers.
+    for (let off = 0; off < block.byteLength; off += 4096) block[off] = 1;
+    held.push(block);
+    reached += CHUNK;
+    // Yield, so the page can paint and the breadcrumb write is not starved by a tight loop.
+    await new Promise((r) => setTimeout(r, 0));
+  }
+  held.length = 0;
+  return {
+    reachedMiB: reached,
+    refused,
+    note: refused
+      ? `this tab refused a host allocation past ${reached} MiB`
+      : `this tab held ${reached} MiB of host memory, the ceiling this probe was asked to try`,
+  };
+}
