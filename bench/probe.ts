@@ -80,6 +80,8 @@ fn main(@builtin(global_invocation_id) g : vec3<u32>) {
 }
 
 export interface AllocResult {
+  /** What the device SAYS it allows for one buffer, from its own limits. */
+  maxBufferSizeMiB: number;
   largestSingleMiB: number;
   totalMiB: number;
   neededSingleMiB: number;
@@ -100,24 +102,33 @@ export async function allocationLadder(device: GPUDevice): Promise<AllocResult> 
   const NEEDED_TOTAL = 2200;   // the whole resident set, approximately
 
   const alive: GPUBuffer[] = [];
+  // BOTH scopes. A size over `maxBufferSize` is a VALIDATION error, not an out of memory one, and
+  // an out of memory scope alone silently reports success for a buffer the device refused. That
+  // bug had this probe claiming a 2048 MiB buffer on an iPhone whose limit is 1024.
   const tryAlloc = async (bytes: number): Promise<boolean> => {
     device.pushErrorScope('out-of-memory');
+    device.pushErrorScope('validation');
     let buf: GPUBuffer | null = null;
     try {
       buf = device.createBuffer({ size: bytes, usage: GPUBufferUsage.STORAGE });
     } catch {
       await device.popErrorScope();
+      await device.popErrorScope();
       return false;
     }
+    const validation = await device.popErrorScope();
     const oom = await device.popErrorScope();
-    if (oom) { buf.destroy(); return false; }
+    if (validation || oom) { buf.destroy(); return false; }
     alive.push(buf);
     return true;
   };
 
-  // largest single binding, doubling
+  // Largest single binding, doubling, and never past what the device says it allows: asking for
+  // more only produces a validation error we already know the answer to.
+  const cap = Math.floor(device.limits.maxBufferSize / MiB);
   let largest = 0;
   for (const mib of [64, 128, 256, 512, 1024, 2048]) {
+    if (mib > cap) break;
     const ok = await tryAlloc(mib * MiB);
     if (!ok) break;
     largest = mib;
@@ -136,12 +147,15 @@ export async function allocationLadder(device: GPUDevice): Promise<AllocResult> 
   alive.length = 0;
 
   return {
+    maxBufferSizeMiB: Math.floor(device.limits.maxBufferSize / MiB),
     largestSingleMiB: largest,
     totalMiB: total,
     neededSingleMiB: NEEDED_SINGLE,
     neededTotalMiB: NEEDED_TOTAL,
     fitsSingle: largest >= NEEDED_SINGLE,
     fitsTotal: total >= NEEDED_TOTAL,
+    // Creation granted is not residency proven: a device can accept a buffer and fail when the
+    // whole working set is live. Read this as an upper bound.
     note: total >= NEEDED_TOTAL
       ? 'this device can hold the model'
       : `this device granted ${total} MiB of the roughly ${NEEDED_TOTAL} MiB the model needs`,

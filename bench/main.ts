@@ -71,6 +71,10 @@ interface Result {
   loadSeconds: number;
   maxNewTokens: number;
   reducePolicy: string | null;
+  /** What the GPU says about itself. A lost device makes every number above meaningless. */
+  gpu: { lostReason: string | null; errors: readonly string[] };
+  /** Bytes the loader says it delivered. A load that "succeeded" without moving bytes did not. */
+  load: { totalBytes: number; cachedBytes: number; fetchedBytes: number } | null;
   smoke: SmokeResult | null;
   allocation: AllocResult | null;
   prompts: PromptResult[];
@@ -228,16 +232,23 @@ async function bench(adapterInfo: Record<string, unknown> | null): Promise<void>
     + `${MAX_NEW_TOKENS} new tokens each.</p><div id="live"></div>`;
   const live = $('live');
 
+  const hardFailures: string[] = [];
   for (const prompt of PROMPTS) {
+    // Independent prompts, so the KV cache from the last one must not survive into this one.
+    engine.reset();
     const messages: Gemma4Message[] = [{ role: 'user', content: prompt.text }];
     const start = performance.now();
     let firstAt = 0;
     let tokens = 0;
     let text = '';
-    for await (const chunk of engine.generate(messages, { maxNewTokens: MAX_NEW_TOKENS })) {
-      if (tokens === 0) firstAt = performance.now();
-      tokens += 1;
-      text = chunk.text;
+    try {
+      for await (const chunk of engine.generate(messages, { maxNewTokens: MAX_NEW_TOKENS })) {
+        if (tokens === 0) firstAt = performance.now();
+        tokens += 1;
+        text = chunk.text;
+      }
+    } catch (err) {
+      hardFailures.push(`prompt "${prompt.name}" threw: ${String(err)}`);
     }
     const end = performance.now();
     const ttftMs = firstAt - start;
@@ -257,7 +268,25 @@ async function bench(adapterInfo: Record<string, unknown> | null): Promise<void>
     live.innerHTML = renderTable(results);
   }
 
-  const failures = validate(results);
+  const gpu = engine.deviceErrors();
+  const receipt = engine.loadReceipt();
+  const loadBytes = receipt
+    ? {
+      totalBytes: receipt.totalBytes,
+      cachedBytes: receipt.cachedBytes,
+      fetchedBytes: receipt.fetchedBytes,
+    }
+    : null;
+  const failures = [...hardFailures, ...validate(results)];
+  if (gpu.lostReason) {
+    failures.unshift(`the GPU device was lost (${gpu.lostReason}). Every dispatch after that is a `
+      + 'no op that returns zeros, which is why the rates above are impossible and the text empty.');
+  }
+  for (const e of gpu.errors) failures.push(`uncaptured GPU error: ${e}`);
+  if (loadBytes && loadBytes.cachedBytes + loadBytes.fetchedBytes < loadBytes.totalBytes) {
+    failures.push(`the loader delivered ${loadBytes.cachedBytes + loadBytes.fetchedBytes} of `
+      + `${loadBytes.totalBytes} bytes, so the weights are incomplete`);
+  }
   result = {
     verdict: failures.length === 0 ? 'ok' : 'FAILED',
     failures,
@@ -269,6 +298,8 @@ async function bench(adapterInfo: Record<string, unknown> | null): Promise<void>
     loadSeconds: Math.round(loadSeconds * 10) / 10,
     maxNewTokens: MAX_NEW_TOKENS,
     reducePolicy: engine.reducePolicy(),
+    gpu,
+    load: loadBytes,
     smoke,
     allocation: alloc,
     prompts: results,
