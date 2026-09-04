@@ -30,12 +30,23 @@ navigator.gpu.requestAdapter = async (opts) => {
 };
 log('adapter clamped to: ' + JSON.stringify(IOS) + ', subgroups hidden');
 
+// Correctness runs want the cache, because re-downloading two gigabytes to answer a question about
+// buffer routing proves nothing extra. The default stays uncached, which is what a device report
+// should be. Add ?cache=1 to keep the weights.
+const useCache = new URLSearchParams(location.search).get('cache') === '1';
+log('weight cache: ' + (useCache ? 'on' : 'off'));
+
+// Every console warning, on the page, because the split plan announces itself through one and a
+// silent split and an absent split look identical from the output alone.
+const realWarn = console.warn.bind(console);
+console.warn = (...a) => { log('warn: ' + a.join(' ')); realWarn(...a); };
+
 const { Gemma4Mobile } = await import('../src/index.ts');
 log('loading...');
 let engine;
 try {
   engine = await Gemma4Mobile.load(null, {
-    cache: false,
+    cache: useCache,
     onProgress: (p) => { if (p.fraction) document.title = (p.fraction * 100).toFixed(0) + '%'; },
   });
 } catch (e) { log('LOAD THREW: ' + e); throw e; }

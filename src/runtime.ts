@@ -44,6 +44,7 @@ import {
   planDecodeStep,
   planPrefillChunk,
   type DispatchStep,
+  type GatherSliceRef,
   type Gemma4Arch,
 } from './plan';
 import { bindingBuffer, bindingEntry } from './kernels/binding';
@@ -87,6 +88,13 @@ export interface GpuExecutorOptions {
   maxChunkTokens: number;
   /** Aborted between chunks and between tokens, which is the contract's one token granularity. */
   isAborted?: () => boolean;
+  /**
+   * Vocabulary ranges of the PLE table, when this adapter's buffers are too small to hold it whole
+   * and engine.ts has planned a split. Absent or of length one means the whole table is one buffer,
+   * which is what every adapter with a limit above 1,174,405,120 bytes reports, and then the plans
+   * built below are byte for byte the ones this engine has always built.
+   */
+  pleSlices?: readonly GatherSliceRef[];
 }
 
 /** Bytes of uniform arena. 731 steps at the 256 byte alignment is about 187 KB; this is room. */
@@ -161,6 +169,8 @@ export class GpuExecutor implements ForwardExecutor {
   private readonly gpu: Gemma4Device;
   private readonly pipelines: PipelineStore;
   private readonly buffers: BufferManager;
+  /** Empty on every adapter that fits the PLE table in one buffer. See GpuExecutorOptions. */
+  private readonly pleSlices: readonly GatherSliceRef[];
   private readonly resources: ExecutorResources;
   private readonly maxChunkTokens: number;
   private readonly isAborted: () => boolean;
@@ -248,6 +258,7 @@ export class GpuExecutor implements ForwardExecutor {
     this.gpu = options.gpu;
     this.pipelines = options.pipelines;
     this.buffers = options.buffers;
+    this.pleSlices = options.pleSlices ?? [];
     this.resources = options.resources;
     this.arch = options.arch ?? GEMMA4_E2B;
     this.kvLayout = options.kvLayout ?? createKvLayout();
@@ -895,7 +906,7 @@ export class GpuExecutor implements ForwardExecutor {
     }
     const geometry = this.geometryFor('gemm', tokens.length, startPosition);
     this.allocateSlots();
-    const steps = prefillStepsFor(this.arch, isLast);
+    const steps = prefillStepsFor(this.arch, isLast, this.pleSlices);
     return this.runSteps(steps, geometry, isLast, () => {
       this.uploadIds(tokens);
       this.uploadRope(startPosition, tokens.length);
@@ -906,7 +917,7 @@ export class GpuExecutor implements ForwardExecutor {
     if (this.isAborted()) return -1;
     const geometry = this.geometryFor('gemv', 1, position);
     this.allocateSlots();
-    return this.runSteps(decodeStepsFor(this.arch), geometry, true, () => {
+    return this.runSteps(decodeStepsFor(this.arch, this.pleSlices), geometry, true, () => {
       this.uploadIds([prevToken]);
       this.uploadRope(position, 1);
     });
@@ -935,7 +946,7 @@ export class GpuExecutor implements ForwardExecutor {
     }
     const geometry = this.geometryFor('gemv', tokens.length, position);
     this.allocateSlots();
-    return this.runStepsWide(decodeStepsFor(this.arch), geometry, () => {
+    return this.runStepsWide(decodeStepsFor(this.arch, this.pleSlices), geometry, () => {
       this.uploadIds(tokens);
       this.uploadRope(position, tokens.length);
     });
@@ -945,7 +956,7 @@ export class GpuExecutor implements ForwardExecutor {
     if (this.isAborted()) return Promise.resolve(-1);
     const geometry: ForwardGeometry = { ...this.geometryFor('gemv', 1, position), idsFromTokenSlot: true };
     this.allocateSlots();
-    return this.runSteps(decodeStepsFor(this.arch), geometry, true, () => {
+    return this.runSteps(decodeStepsFor(this.arch, this.pleSlices), geometry, true, () => {
       this.uploadRope(position, 1);
     });
   }
@@ -968,12 +979,16 @@ export class GpuExecutor implements ForwardExecutor {
  * reaches the executor without anybody remembering to invalidate anything. Building 731 small
  * objects is nothing next to the dispatches they describe.
  */
-function decodeStepsFor(arch: Gemma4Arch): DispatchStep[] {
-  return planDecodeStep(arch);
+function decodeStepsFor(arch: Gemma4Arch, pleSlices: readonly GatherSliceRef[]): DispatchStep[] {
+  return planDecodeStep(arch, pleSlices);
 }
 
-function prefillStepsFor(arch: Gemma4Arch, isLast: boolean): DispatchStep[] {
-  return planPrefillChunk(arch, isLast);
+function prefillStepsFor(
+  arch: Gemma4Arch,
+  isLast: boolean,
+  pleSlices: readonly GatherSliceRef[],
+): DispatchStep[] {
+  return planPrefillChunk(arch, isLast, pleSlices);
 }
 
 /** Re-exported so a caller can size a BufferManager without importing execute.ts as well. */

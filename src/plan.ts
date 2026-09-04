@@ -266,6 +266,23 @@ export interface DispatchStep {
   readonly window?: number;
   /** MLP intermediate width, on the MLP matmul and activation steps: 6144 producer, 12288 consumer. */
   readonly intermediate?: number;
+  /**
+   * On the per layer embedding gather only, and only on an adapter whose buffers are too small to
+   * hold the PLE table whole: which vocabulary range of the split table this dispatch serves.
+   *
+   * Absent everywhere else, and absent on every step of every plan on an adapter that grants a
+   * large enough buffer, so the plan those adapters run is unchanged to the object. See
+   * ../tableSplit.ts for the split and planEmbed below for why the expansion is here rather than
+   * in the executor.
+   */
+  readonly gatherSlice?: GatherSliceRef;
+}
+
+/** The slice one sliced gather dispatch serves, carried on the step that describes it. */
+export interface GatherSliceRef {
+  readonly index: number;
+  readonly startRow: number;
+  readonly rowCount: number;
 }
 
 /**
@@ -547,10 +564,42 @@ export function planLayer(arch: Gemma4Arch, layer: number, mode: 'gemv' | 'gemm'
  * operand. Fusing the pair is a performance round move, and it is the same trade planLayer's
  * comment argues for the norms.
  */
-export function planEmbed(arch: Gemma4Arch): DispatchStep[] {
+/**
+ * The per layer embedding gather: one step, or one step per slice of a split table.
+ *
+ * WHY THE EXPANSION IS HERE. A split table is read by one dispatch per vocabulary range
+ * (../tableSplit.ts), so the gather is N dispatches instead of one. `resolveStep` is one step to
+ * one dispatch and runs inside the decode loop, so turning it into a one to many function would
+ * put an array allocation on the hot path of every step in the forward to serve a case that fires
+ * on one adapter family. Expanding in the plan costs nothing at all: the plan is built once per
+ * forward, `resolveStep` stays what it was, and runtime.ts does not change.
+ *
+ * With no slices, or with the one slice a large enough adapter plans, this returns exactly the
+ * single step it always returned, with no `gatherSlice` field on it. That is what keeps the M1's
+ * plan identical rather than merely equivalent.
+ */
+function planPleGather(pleSlices?: readonly GatherSliceRef[]): DispatchStep[] {
+  const single: DispatchStep = {
+    kernel: 'ple-gather-4bit', phase: 'embed', layer: -1, role: 'per layer embedding gather',
+  };
+  if (!pleSlices || pleSlices.length <= 1) return [single];
+  return pleSlices.map((slice) => ({
+    // Spelled out rather than imported, because this file has no imports on purpose (see the
+    // header). kernels/embedGather.ts exports the same string as PLE_GATHER_SLICED_NAME, and
+    // scripts/engine-check/orchestrator.mjs asserts that every kernel a plan names is registered,
+    // so the two cannot drift apart without a check failing.
+    kernel: 'ple-gather-4bit-sliced',
+    phase: 'embed' as const,
+    layer: -1,
+    role: 'per layer embedding gather',
+    gatherSlice: slice,
+  }));
+}
+
+export function planEmbed(arch: Gemma4Arch, pleSlices?: readonly GatherSliceRef[]): DispatchStep[] {
   return [
     { kernel: 'embed-gather-2bit', phase: 'embed', layer: -1, role: 'embed_tokens gather' },
-    { kernel: 'ple-gather-4bit', phase: 'embed', layer: -1, role: 'per layer embedding gather' },
+    ...planPleGather(pleSlices),
     { kernel: DENSE_BF16, phase: 'embed', layer: -1, role: 'per_layer_model_projection' },
     { kernel: 'rms-norm', phase: 'embed', layer: -1, role: 'per_layer_projection_norm', intermediate: arch.pleDim },
     { kernel: 'scale-add', phase: 'embed', layer: -1, role: 'per layer inputs add' },
@@ -593,8 +642,8 @@ export function planHead(arch: Gemma4Arch, mode: 'gemv' | 'gemm' = 'gemm'): Disp
 }
 
 /** Every dispatch of one steady state decode token, in order. */
-export function planDecodeStep(arch: Gemma4Arch): DispatchStep[] {
-  const steps: DispatchStep[] = [...planEmbed(arch)];
+export function planDecodeStep(arch: Gemma4Arch, pleSlices?: readonly GatherSliceRef[]): DispatchStep[] {
+  const steps: DispatchStep[] = [...planEmbed(arch, pleSlices)];
   for (let layer = 0; layer < arch.layerCount; layer += 1) {
     steps.push(...planLayer(arch, layer, 'gemv'));
   }
@@ -628,8 +677,12 @@ export function planDecodeStep(arch: Gemma4Arch): DispatchStep[] {
  * single position the head reads is the remaining 8 percent and needs the residual seeded at row
  * 0, which is a second submission; it is deliberately not done here.
  */
-export function planPrefillChunk(arch: Gemma4Arch, isLastChunk: boolean): DispatchStep[] {
-  const steps: DispatchStep[] = [...planEmbed(arch)];
+export function planPrefillChunk(
+  arch: Gemma4Arch,
+  isLastChunk: boolean,
+  pleSlices?: readonly GatherSliceRef[],
+): DispatchStep[] {
+  const steps: DispatchStep[] = [...planEmbed(arch, pleSlices)];
   const layers = isLastChunk ? arch.layerCount : arch.kvProducerLayers;
   for (let layer = 0; layer < layers; layer += 1) {
     steps.push(...planLayer(arch, layer, 'gemm'));

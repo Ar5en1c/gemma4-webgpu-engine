@@ -41,13 +41,13 @@ ship a version of it. As far as we can tell this is the first **browser** engine
 ## Requirements
 
 - WebGPU with the `shader-f16` feature. Chrome 121+ or Edge on Windows and macOS; Safari 26+.
-- **A `maxBufferSize` above 1.1 GB.** This is the real constraint today and it is a known
-  limitation, not a property of the model. The per layer embedding table is 1,174,405,120 bytes and
-  the engine still allocates it as one buffer, so any adapter granting 1 GiB or less refuses it.
-  iOS grants exactly 1 GiB, so **the engine does not run on iPhone or iPad yet**; the WebGPU
-  default is 256 MiB. `tableSplit.ts` is the planned fix and its planner is written and tested but
-  not yet wired into allocation. Until then the engine loads with a clear error on those devices
-  rather than emitting garbage. The device profile on the bench page works everywhere.
+- **A `maxBufferSize` of 128 MiB or more**, which is the WebGPU specification floor, so every
+  conformant adapter qualifies. The per layer embedding table is 1,174,405,120 bytes and no adapter
+  holds that in one buffer: iOS grants exactly 1 GiB and the specification default is 256 MiB. The
+  engine splits the table by vocabulary row and gathers once per slice, so the table's size stops
+  being a limit on which devices can run it (`tableSplit.ts`). At iOS's 1 GiB that is two slices and
+  one extra dispatch per gather. Adapters with room for the whole table allocate it whole and run
+  the plan they always ran.
 - About **2 GB** of download on first run, cached afterwards, and roughly 3 GB of free memory.
 
 ## Try it

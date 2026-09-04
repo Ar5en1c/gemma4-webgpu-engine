@@ -138,7 +138,7 @@ export interface Kernel {
 import { scaleAddKernel } from './scaleAdd';
 import { rmsNormKernel, rmsNormWeightlessKernel } from './rmsNorm';
 import { ropeKernel } from './rope';
-import { embedTokensGatherKernel, pleGatherKernel } from './embedGather';
+import { embedTokensGatherKernel, pleGatherKernel, pleGatherSlicedKernel } from './embedGather';
 import { qgemv2Kernel, qgemv4Kernel, qgemv8Kernel, qgemv4GeluKernel, qgemv2GeluKernel, qgemv8GeluKernel } from './qgemv';
 import {
   qgemv2WideKernel, qgemv4WideKernel, qgemv8WideKernel, qgemv4GeluWideKernel, qgemv2GeluWideKernel, qgemv8GeluWideKernel,
@@ -167,6 +167,12 @@ export const KERNELS: Kernel[] = [
   ropeKernel,
   embedTokensGatherKernel,
   pleGatherKernel,
+  // The PLE gather over one vocabulary range of a table too large for one buffer on this adapter.
+  // Registered rather than conditional: a registry that depends on the device is a registry the
+  // Node checks cannot walk. It compiles only when a plan names it, which happens only where the
+  // split is planned, so on every adapter with room for the whole table this entry costs a module
+  // that is never created. See ./embedGather.ts and ../tableSplit.ts.
+  pleGatherSlicedKernel,
   // The QAT dequant matmul family, K4, K5, K13, K16 and K15, which is where the per token
   // bandwidth goes on the M1 (DECODE-CAMPAIGN.md 1) and therefore where the engine's performance
   // lives. Checked by scripts/engine-check/k-matmul.mjs.
