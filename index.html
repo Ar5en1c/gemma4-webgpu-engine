@@ -53,6 +53,13 @@
 <body>
 <div class="wrap">
   <h1>Gemma 4 WebGPU Engine</h1>
+  <section style="border-color:var(--bad)">
+    <h2 style="color:var(--bad)">Known broken, 2026-09-04</h2>
+    <p style="margin:0">This engine currently emits incoherent text. The cause is bisected to a
+    weight layout change of 2026-09-02 and is being fixed. Benchmark numbers from this page are
+    not trustworthy until then. The device profile below is still accurate and useful.</p>
+  </section>
+
   <p class="lede">A clean-room inference engine for Gemma 4 E2B that runs entirely in your browser.
   Nothing you type leaves this machine. This page profiles your GPU and, if you ask it to,
   benchmarks the engine on it.</p>
