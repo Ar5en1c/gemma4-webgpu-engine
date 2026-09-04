@@ -193,9 +193,21 @@ async function profile(): Promise<Record<string, unknown> | null> {
   }
   crumb('storage', storage ?? { available: false });
 
+  const browser = iosBrowser();
+  crumb('browser', { onIos: browser.onIos, thirdParty: browser.thirdParty, name: browser.name });
+
+  if (browser.onIos) rows.push(['browser', browser.thirdParty ? `${browser.name} on iOS` : 'Safari on iOS']);
+
   out.innerHTML = `<div class="scroll"><table>${
     rows.map(([k, v]) => `<tr><th>${k}</th><td class="n">${escapeHtml(v)}</td></tr>`).join('')
-  }</table></div>` + (canRun
+  }</table></div>`
+    + (browser.thirdParty
+      ? `<p class="bad"><strong>${escapeHtml(browser.name)} on iOS renders with WebKit, not its own `
+        + 'engine, and a third party browser gets a smaller memory budget than Safari does. A 2 GB '
+        + 'model is exactly the size where that decides the outcome, so if this is killed here, '
+        + 'open the same page in Safari before concluding anything about the device. Site data is '
+        + `per app too: clearing Safari's does nothing to what ${escapeHtml(browser.name)} stored.</p>`
+      : '') + (canRun
     ? ''
     : `<p class="bad" style="margin-bottom:0">Missing required feature: ${missing.join(', ')}. `
       + 'The engine will not run here.</p>');
@@ -510,6 +522,32 @@ async function checkForStalePage(): Promise<void> {
 }
 
 void checkForStalePage();
+
+/**
+ * Which browser this is, on a platform where that decides the memory budget.
+ *
+ * Every browser on iOS renders with WebKit, so Chrome, Edge and Firefox there are WKWebView hosts
+ * rather than their own engines. That matters for one reason only, and it is the reason a 2 GB
+ * model load cares: a third party app's web content process runs under a tighter memory limit than
+ * Safari's own, so the same page on the same phone can load in Safari and be killed in Chrome.
+ *
+ * This is a hint, not a diagnosis. It is stated as something to try because trying it costs one
+ * tap and rules out a whole class of failure that no amount of instrumentation here can see.
+ *
+ * Detection is by user agent, which is guesswork by nature: CriOS, FxiOS and EdgiOS are the tokens
+ * those browsers add on iOS. A wrong guess costs a sentence of advice, so it is worth making.
+ */
+function iosBrowser(): { onIos: boolean; thirdParty: boolean; name: string } {
+  const ua = navigator.userAgent;
+  // iPadOS reports a Macintosh user agent, so the touch point count is what separates it from a Mac.
+  const onIos = /iPhone|iPod|iPad/.test(ua)
+    || (/Macintosh/.test(ua) && typeof navigator.maxTouchPoints === 'number' && navigator.maxTouchPoints > 1);
+  const tokens: [RegExp, string][] = [[/CriOS/, 'Chrome'], [/FxiOS/, 'Firefox'], [/EdgiOS/, 'Edge'], [/OPT\//, 'Opera']];
+  for (const [re, name] of tokens) {
+    if (re.test(ua)) return { onIos, thirdParty: onIos, name };
+  }
+  return { onIos, thirdParty: false, name: onIos ? 'Safari' : 'not iOS' };
+}
 
 /**
  * Show what a previous run was doing when this device stopped it.
