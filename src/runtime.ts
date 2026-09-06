@@ -24,6 +24,8 @@
 //      dispatch still reads, which is exactly the class of bug that reads as a wrong number rather
 //      than as an error.
 
+import { pleGateSplits } from './kernels/pleSplit';
+import { producerDownSplits } from './kernels/exactSplit';
 import { BufferManager, type BufferLike, type DeviceLike } from './buffers';
 import {
   ACTIVATION_BYTES,
@@ -50,6 +52,8 @@ import {
 import { bindingBuffer, bindingEntry } from './kernels/binding';
 import { kernelByName, type KernelBindResult } from './kernels/registry';
 import { ROPE_GLOBAL, ROPE_SLIDING, ropeTables } from './kernels/rope';
+import { gemvGeometry, kSplitsOf } from './kernels/qgemv';
+import { attentionGeometry, kvSplitsOf } from './kernels/attention';
 
 /**
  * The seam between the executor and whatever produced the weights. The engine's loader implements
@@ -75,9 +79,29 @@ export interface ForwardExecutor {
    * that offers this lets the greedy loop keep one step in flight (plan.ts runGreedyLoop).
    */
   decodeAhead?(position: number): Promise<number>;
+  /**
+   * Optional: run one wide pass over `tokens` placed at `position` onward and answer the model's
+   * argmax after each of them. An executor that offers this can be driven by the speculative loop
+   * (draft.ts runSpeculativeLoop); the dry recorder does not offer it and runs greedy.
+   */
+  verify?(tokens: readonly number[], position: number): Promise<number[]>;
 }
 
 export interface GpuExecutorOptions {
+  /**
+   * False keeps the six separate attention prologue kernels on a decode step instead of the
+   * fused two (kernels/attnPrologue.ts), for a control run. Default true.
+   */
+  attentionPrologue?: boolean;
+  batchProjections?: boolean;
+  /**
+   * On a one token step the PLE projection reads its layer's row in place out of the per layer
+   * input, through an offset in its params, instead of copying the row into a slot of its own
+   * first: 35 buffer copies a token gone, and each copy closed the compute pass around itself.
+   * Default true; false keeps the copies, for a control run. Token identical either way
+   * (lab-results/5070-attention-prologue-and-queue-sep05.json, parity r6).
+   */
+  directPle?: boolean;
   gpu: Gemma4Device;
   pipelines: PipelineStore;
   buffers: BufferManager;
@@ -164,6 +188,9 @@ interface DecodePlanCache {
 }
 
 export class GpuExecutor implements ForwardExecutor {
+  private readonly attentionPrologue: boolean;
+  private readonly batchProjections: boolean;
+  private readonly directPle: boolean;
   readonly arch: Gemma4Arch;
   readonly kvLayout: KvLayout;
   private readonly gpu: Gemma4Device;
@@ -194,6 +221,13 @@ export class GpuExecutor implements ForwardExecutor {
   // campaign reports are measured with it off. The timed run's own wall clock is recorded with the
   // GPU sum so the cost of the instrument is visible rather than assumed.
   private timing = false;
+  /**
+   * Coarse timing: one timestamp pair per compute PASS instead of one per dispatch, so the number
+   * is the token's GPU time as the loop pays it, drains between dependent dispatches included,
+   * and the per kernel table is empty. Per dispatch timing gives every dispatch its own pass and
+   * so adds a pass boundary to each; the difference between the two readings is that overhead.
+   */
+  private timingCoarse = false;
   private querySet: GPUQuerySet | null = null;
   private queryResolve: GPUBuffer | null = null;
   private queryStaging: GPUBuffer | null = null;
@@ -205,12 +239,14 @@ export class GpuExecutor implements ForwardExecutor {
    * Turn per dispatch GPU timing on or off. Returns the state actually reached: on is refused when
    * the device was not created with the `timestamp-query` feature (device.ts, `timestamps`).
    */
-  setTiming(on: boolean): boolean {
+  setTiming(on: boolean, mode: 'dispatch' | 'coarse' = 'dispatch'): boolean {
     if (on && !this.gpu.features.timestampQuery) {
       this.timing = false;
+      this.timingCoarse = false;
       return false;
     }
     this.timing = on;
+    this.timingCoarse = on && mode === 'coarse';
     return this.timing;
   }
 
@@ -255,6 +291,9 @@ export class GpuExecutor implements ForwardExecutor {
   }
 
   constructor(options: GpuExecutorOptions) {
+    this.attentionPrologue = options.attentionPrologue ?? true;
+    this.batchProjections = options.batchProjections ?? false;
+    this.directPle = options.directPle ?? true;
     this.gpu = options.gpu;
     this.pipelines = options.pipelines;
     this.buffers = options.buffers;
@@ -454,6 +493,7 @@ export class GpuExecutor implements ForwardExecutor {
 
   private geometryFor(mode: 'gemv' | 'gemm', tokens: number, startPosition: number): ForwardGeometry {
     return {
+      directPle: this.directPle,
       arch: this.arch,
       mode,
       tokens,
@@ -719,16 +759,22 @@ export class GpuExecutor implements ForwardExecutor {
 
     const encoder = this.device.createCommandEncoder({ label: `gemma4:${geometry.mode}` });
     const timed = this.timing;
+    const coarse = this.timingCoarse;
     const querySet = timed ? this.ensureQueries(encoded.length * 2) : null;
     let pass: GPUComputePassEncoder | null = null;
+    // Coarse timing numbers the passes rather than the dispatches: a pass reopens only around a
+    // buffer copy, so a token is a handful of pairs and the sum is its GPU time with every drain
+    // between dependent dispatches inside it.
+    let passCount = 0;
     const openPass = (index: number): GPUComputePassEncoder => {
       if (!pass) {
         const descriptor: GPUComputePassDescriptor = { label: `gemma4:${geometry.mode}` };
         if (querySet) {
+          const pair = coarse ? passCount++ : index;
           descriptor.timestampWrites = {
             querySet,
-            beginningOfPassWriteIndex: index * 2,
-            endOfPassWriteIndex: index * 2 + 1,
+            beginningOfPassWriteIndex: pair * 2,
+            endOfPassWriteIndex: pair * 2 + 1,
           };
         }
         pass = encoder.beginComputePass(descriptor);
@@ -759,30 +805,33 @@ export class GpuExecutor implements ForwardExecutor {
       active.dispatchWorkgroups(item.dispatch[0], item.dispatch[1], item.dispatch[2]);
       this.dispatchesEncoded += 1;
       // Timing mode: one pass per dispatch, because the timestamps belong to the pass.
-      if (timed) closePass();
+      if (timed && !coarse) closePass();
     }
     closePass();
 
+    const pairs = coarse ? passCount : encoded.length;
     if (querySet) {
-      encoder.resolveQuerySet(querySet, 0, encoded.length * 2, this.queryResolve!, 0);
-      encoder.copyBufferToBuffer(this.queryResolve!, 0, this.queryStaging!, 0, encoded.length * 16);
+      encoder.resolveQuerySet(querySet, 0, pairs * 2, this.queryResolve!, 0);
+      encoder.copyBufferToBuffer(this.queryResolve!, 0, this.queryStaging!, 0, pairs * 16);
     }
     const wallStart = performance.now();
     const recordTiming = async (): Promise<void> => {
       if (!querySet) return;
       const staging = this.queryStaging!;
-      await staging.mapAsync(GPUMapMode.READ, 0, encoded.length * 16);
-      const stamps = new BigUint64Array(staging.getMappedRange(0, encoded.length * 16).slice(0));
+      await staging.mapAsync(GPUMapMode.READ, 0, pairs * 16);
+      const stamps = new BigUint64Array(staging.getMappedRange(0, pairs * 16).slice(0));
       staging.unmap();
       const wallMs = performance.now() - wallStart;
       const steps: StepTiming[] = [];
       let totalNs = 0;
-      for (let i = 0; i < encoded.length; i += 1) {
+      for (let i = 0; i < pairs; i += 1) {
         const begin = stamps[i * 2]!;
         const end = stamps[i * 2 + 1]!;
         const ns = end >= begin ? Number(end - begin) : 0;
-        const step = encoded[i]!.resolved.step;
-        steps.push({ kernel: encoded[i]!.resolved.kernel, role: step.role, phase: step.phase, layer: step.layer, ns });
+        if (!coarse) {
+          const step = encoded[i]!.resolved.step;
+          steps.push({ kernel: encoded[i]!.resolved.kernel, role: step.role, phase: step.phase, layer: step.layer, ns });
+        }
         totalNs += ns;
       }
       this.timings.push({
@@ -917,7 +966,7 @@ export class GpuExecutor implements ForwardExecutor {
     if (this.isAborted()) return -1;
     const geometry = this.geometryFor('gemv', 1, position);
     this.allocateSlots();
-    return this.runSteps(decodeStepsFor(this.arch, this.pleSlices), geometry, true, () => {
+    return this.runSteps(decodeStepsFor(this.arch, this.pleSlices, this.attentionPrologue, this.batchProjections && geometry.tokens === 1, geometry.tokens === 1), geometry, true, () => {
       this.uploadIds([prevToken]);
       this.uploadRope(position, 1);
     });
@@ -946,7 +995,7 @@ export class GpuExecutor implements ForwardExecutor {
     }
     const geometry = this.geometryFor('gemv', tokens.length, position);
     this.allocateSlots();
-    return this.runStepsWide(decodeStepsFor(this.arch, this.pleSlices), geometry, () => {
+    return this.runStepsWide(decodeStepsFor(this.arch, this.pleSlices, this.attentionPrologue, this.batchProjections && geometry.tokens === 1, geometry.tokens === 1), geometry, () => {
       this.uploadIds(tokens);
       this.uploadRope(position, tokens.length);
     });
@@ -956,7 +1005,7 @@ export class GpuExecutor implements ForwardExecutor {
     if (this.isAborted()) return Promise.resolve(-1);
     const geometry: ForwardGeometry = { ...this.geometryFor('gemv', 1, position), idsFromTokenSlot: true };
     this.allocateSlots();
-    return this.runSteps(decodeStepsFor(this.arch, this.pleSlices), geometry, true, () => {
+    return this.runSteps(decodeStepsFor(this.arch, this.pleSlices, this.attentionPrologue, this.batchProjections && geometry.tokens === 1, geometry.tokens === 1), geometry, true, () => {
       this.uploadRope(position, 1);
     });
   }
@@ -979,8 +1028,23 @@ export class GpuExecutor implements ForwardExecutor {
  * reaches the executor without anybody remembering to invalidate anything. Building 731 small
  * objects is nothing next to the dispatches they describe.
  */
-function decodeStepsFor(arch: Gemma4Arch, pleSlices: readonly GatherSliceRef[]): DispatchStep[] {
-  return planDecodeStep(arch, pleSlices);
+function decodeStepsFor(arch: Gemma4Arch, pleSlices: readonly GatherSliceRef[], attentionPrologue = true, batchProjections = false, allowProducerSplit = true): DispatchStep[] {
+  // The split is read HERE, from the live geometry, rather than passed down from a caller,
+  // because plan.ts has no imports and this is the one place every real decode plan is built. A
+  // profile that turned kSplits on before any pipeline was compiled gets the fold steps; every
+  // other run gets the plan this engine has always built, to the object. A verify pass runs the
+  // same plan: the wide family carries the split as qgemv-2bit-gelu-split-m2 (execute.ts
+  // gemvWide), and the decode step cache keys on the position count, so a token and a pass never
+  // share an entry.
+  return planDecodeStep(arch, pleSlices, {
+    attentionPrologue,
+    batchProjections,
+    producerDownKSplits: allowProducerSplit ? producerDownSplits() : 1,
+    pleGateKSplits: allowProducerSplit ? pleGateSplits() : 1,
+    downKSplits: kSplitsOf(gemvGeometry(2)),
+    attnKvSplits: kvSplitsOf(attentionGeometry()),
+    attnKSplits: kSplitsOf(gemvGeometry(4)),
+  });
 }
 
 function prefillStepsFor(

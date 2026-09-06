@@ -143,7 +143,28 @@ export interface GemvGeometry {
    * loop is docs/ENGINE-PERF.md section 13 (the performance page's `bench` set is how a
    * candidate is priced: interleaved, cycling every layer's weights, GPU mean per dispatch).
    */
-  inner?: 'classic' | 'tile16u' | 'tile16' | 'tilefloor';
+  inner?: 'classic' | 'tile16u' | 'tile16' | 'tilefloor' | 'tile8u';
+  /**
+   * How many ways the K reduction is cut across workgroups, the flash decoding shape applied to a
+   * GEMV. Absent or 1 is the shipped kernel to the byte, which the gate asserts.
+   *
+   * WHY THIS EXISTS, AND ONLY FOR THIS SHAPE. down_proj is 1536 rows by K 12288. At 16 rows a
+   * workgroup that is 96 workgroups, and on a part with 48 SMs 96 workgroups is two apiece with
+   * nothing left to hide a stall behind. Its siblings gate and up are the same bytes transposed,
+   * 12288 rows by K 1536, which is 768 workgroups, and on the 5070 they run at 428 GB/s while
+   * down_proj runs at 129 (lab-results/5070-per-kernel-decode-sep04.json). Same bytes, same
+   * kernel, 3.3x apart, and the only thing that differs is how many workgroups the shape offers.
+   *
+   * Splitting K by S multiplies the workgroup count by S and costs one merge dispatch, which sums
+   * S partials a row and applies the scales the split kernel deliberately does not. The partial
+   * is stored RAW, before `xs * scales[row]` and before srqOut, because those are per row and
+   * would otherwise be applied S times.
+   *
+   * This reassociates the K sum, so it is round 3 lead ruling 5's class of change: gated against
+   * the oracle rather than argued, and off by default until it is priced on both machines. On the
+   * M1, 96 workgroups over 8 cores is already twelve apiece, so the prediction there is a loss.
+   */
+  kSplits?: 1 | 2 | 4 | 8;
 }
 
 /**
@@ -215,9 +236,37 @@ function assertGeometry(g: GemvGeometry): void {
   if (g.wordsPerLane !== 1 && g.wordsPerLane !== 2 && g.wordsPerLane !== 4) {
     throw new Error(`gemv geometry: wordsPerLane must be 1, 2 or 4, got ${g.wordsPerLane}`);
   }
-  if (g.inner !== undefined && !['classic', 'tile16u', 'tile16', 'tilefloor'].includes(g.inner)) {
-    throw new Error(`gemv geometry: inner must be classic, tile16u, tile16 or tilefloor, got ${String(g.inner)}`);
+  if (g.inner !== undefined && !['classic', 'tile16u', 'tile16', 'tilefloor', 'tile8u'].includes(g.inner)) {
+    throw new Error(`gemv geometry: inner must be classic, tile16u, tile16, tilefloor or tile8u, got ${String(g.inner)}`);
   }
+  const ks = (g.kSplits ?? 1) as number;
+  if (ks !== 1 && ks !== 2 && ks !== 4 && ks !== 8) {
+    throw new Error(`gemv geometry: kSplits must be 1, 2, 4 or 8, got ${String(ks)}`);
+  }
+}
+
+/**
+ * The largest split the geometry allows. The partial scratch slot is sized at this rather than at
+ * whatever a profile asks for, so the slot does not change size with the device and a plan taken
+ * on one machine can be replayed on another.
+ */
+export const GEMV_MAX_K_SPLITS = 8;
+
+/** Splits this geometry asks for, with the default that means "the shipped kernel". */
+export function kSplitsOf(geometry: Readonly<GemvGeometry>): number {
+  return geometry.kSplits ?? 1;
+}
+
+/**
+ * The same geometry with the K split removed. Every 2-bit site that the plan does NOT fold builds
+ * through this: lm_head, the projections, and the unsplit down_proj entry. Before it existed the
+ * split was read straight off the geometry singleton by every 2-bit build, so turning the split on
+ * for down_proj silently split lm_head too, with no fold after it. A split dispatch is only correct
+ * when a merge follows, and only the plan knows that, so the split is carried by kernel identity
+ * (the `-split` entries) and never by the shared name.
+ */
+export function unsplitGemvGeometry(geometry: Readonly<GemvGeometry>): Readonly<GemvGeometry> {
+  return kSplitsOf(geometry) === 1 ? geometry : Object.freeze({ ...geometry, kSplits: 1 });
 }
 
 /**
@@ -326,6 +375,13 @@ export const GEMV_GELU_KERNEL: Readonly<Record<GemvBits, string>> = Object.freez
   2: 'qgemv-2bit-gelu', 4: 'qgemv-4bit-gelu', 8: 'qgemv-8bit-gelu',
 });
 
+/**
+ * The split K build of the 2-bit gelu-fused down_proj. A separate kernel, not a mode of the one
+ * above, because the split is only correct when the plan also emits the fold (ROLE_DOWN_MERGE):
+ * naming it makes a split dispatch without a merge unrepresentable rather than merely unintended.
+ */
+export const GEMV_GELU_SPLIT_KERNEL_2BIT = 'qgemv-2bit-gelu-split';
+
 export function prologueWgsl(prologue: GemvPrologue): string {
   if (prologue === 'none') {
     return `@group(0) @binding(2) var<storage, read> x: array<vec4<f32>>;
@@ -339,23 +395,47 @@ export function prologueWgsl(prologue: GemvPrologue): string {
 ${GELU_MUL_WGSL_FN}
 // The fused K10 prologue: one activation vector, gelu of the gate times the up projection.
 fn act(i: u32) -> vec4<f32> {
-  return geluTanh(gate[i]) * up[i];
+  return geluTanh(gate[i]) * up[i + params.upOffset];
 }`;
 }
+
+/**
+ * The split K build of the classic 4-bit and 8-bit loop, its own kernel names as the 2-bit tile's
+ * split is (GEMV_GELU_SPLIT_KERNEL_2BIT): the plan names them only where it also names the fold,
+ * which for these families lives in the CONSUMER (kernels/attnPrologue.ts's fold variants) rather
+ * than in a merge dispatch. Why: on the RTX 5070 a small GEMV's time is its walk, six dependent
+ * iterations at K 1536 whatever the workgroup count, and the same rows at half the K run 0.6x
+ * and at a quarter 0.45x (src/dev/gemvsweep.html?only=walk). The 2-bit split's merge dispatch
+ * would give a third of that back; a fold in the consumer gives none of it back.
+ */
+export const GEMV_SPLIT_KERNEL: Readonly<Record<4 | 8, string>> = Object.freeze({ 4: 'qgemv-4bit-split', 8: 'qgemv-8bit-split' });
 
 export function qgemvWgsl(
   bits: GemvBits,
   variant: MatmulReduceVariant,
   geometry: Readonly<GemvGeometry> = activeGeometry[bits],
   prologue: GemvPrologue = 'none',
+  split = false,
+  exactPartials = false,
 ): string {
   assertGeometry(geometry as GemvGeometry);
+  if (exactPartials && (bits === 2 || !split)) throw new Error('unscaled partials require a 4-bit or 8-bit split');
+  if (exactPartials && geometry.inner !== undefined && geometry.inner !== 'classic') {
+    throw new Error('unscaled partials require the classic packed layout');
+  }
   // The activation read, through the prologue when there is one.
   const xr = (expr: string): string => (prologue === 'gelu' ? `act(${expr})` : `x[${expr}]`);
   if (bits === 2) return qgemv2TileWgsl(variant, geometry, prologue);
+  // The 4-bit tile loop, on the eight row interleaved layout. Priced on the sweep page before
+  // any tensor is repacked to it; the shipped 4-bit loop is the classic one below until then.
+  if (bits === 4 && geometry.inner === 'tile8u') return qgemv4TileWgsl(variant, geometry, prologue);
   if (geometry.inner !== undefined && geometry.inner !== 'classic') {
     throw new Error(`qgemv-${bits}bit has only the classic inner loop, got ${geometry.inner}`);
   }
+  if (split && prologue !== 'none' && !exactPartials) throw new Error(`qgemv-${bits}bit: the K split has no prologue form`);
+  // The split is a property of the kernel's name, never of the shared geometry: the plain build
+  // reads KS 1 whatever a profile set, exactly as qgemv-2bit does beside its split sibling.
+  const KS = split ? kSplitsOf(geometry) : 1;
   const W = geometry.workgroupSize;
   const R = geometry.rowsPerVsg;
   const V = geometry.wordsPerLane;
@@ -428,11 +508,35 @@ export function qgemvWgsl(
   const sums = Array.from({ length: R }, (_, r) => `  let sum${r} = mmSum(acc${r}, lid);`).join('\n');
   const stores = Array.from({ length: R }, (_, r) => [
     `    if (row${r} < params.numRows) {`,
-    `      dst[row${r}] = srqOut((xs * scales[row${r}]) * sum${r});`,
+    KS === 1
+      ? `      dst[row${r}] = srqOut((xs * scales[row${r}]) * sum${r});`
+      // The split cut is the LAST linear step, as on the 2-bit tile: each partial carries its
+      // row scale and the fold owns the snap.
+      : `      dst[row${r} * ${KS}u + split] = ${exactPartials ? `sum${r}` : `(xs * scales[row${r}]) * sum${r}`};`,
     '    }',
   ].join('\n')).join('\n');
+  // The band of K this workgroup walks under a split. Iteration slots are the kIters whole
+  // iterations plus the guarded tail, which belongs to the band that owns slot kIters; wid.z is
+  // the split and num_workgroups.z the count, so the cut needs no room in the params block.
+  const band = KS === 1 ? '' : `  let split = wid.z;
+  let slots = params.kIters + ${exactPartials ? `select(0u, 1u, params.kWords % ${32 * V}u != 0u)` : '1u'};
+  let per = (slots + ${KS - 1}u) / ${KS}u;
+  let iLo = min(split * per, slots);
+  let iHi = min(iLo + per, slots);
+`;
+  const intFrom = KS === 1 ? '0u' : 'iLo';
+  const intTo = KS === 1 ? 'params.kIters' : 'min(iHi, params.kIters)';
+  const intStart = KS === 1 ? 'lane' : 'lane + iLo * 32u';
+  const tailGuard = KS === 1 ? 'wi < kVec' : 'iHi > params.kIters && wi < kVec';
+  const floatBand = KS === 1 ? '' : `    let oPer = (kOnes + ${KS - 1}u) / ${KS}u;
+    let oLo = min(split * oPer, kOnes);
+    let oHi = min(oLo + oPer, kOnes);
+`;
+  const floatFrom = KS === 1 ? '0u' : 'oLo';
+  const floatTo = KS === 1 ? 'kOnes' : 'oHi';
+  const floatStart = KS === 1 ? 'lane' : 'lane + oLo * 32u';
 
-  return /* wgsl */ `${matmulReducePrelude(variant, W)}
+  const code = /* wgsl */ `${matmulReducePrelude(variant, W)}
 struct GemvParams {
   // Packed u32 words per weight row, so K / ${CODES_PER_WORD[bits]} for this ${bits}-bit family.
   kWords: u32,
@@ -448,7 +552,7 @@ struct GemvParams {
   inScale: f32,
   // The module's output_activation_scale, applied to each written row. 0.0 means no rounding.
   outScale: f32,
-  pad1: u32,
+  upOffset: u32,
   pad2: u32,
 }
 
@@ -496,7 +600,7 @@ fn main(
   let rLast = params.numRows - 1u;
   let kVec = params.kWords / ${V}u;
 ${rowDecls}
-
+${band}
   // The two K loops land in these. f32 and i32 accumulators only, never f16: LlamaWeb
   // (arXiv 2605.20706) measured f16 accumulation producing incoherent output on Apple M-series.
 ${accDecls}
@@ -507,23 +611,23 @@ ${accDecls}
     // i32 with no rounding anywhere: the worst text stack reduction is bounded near 6.3e6, far
     // inside i32 and inside f32's exact integer range, so the f32 handoff below is exact too.
 ${accIDecls}
-    var wi = lane;
-    for (var i = 0u; i < params.kIters; i = i + 1u) {
+    var wi = ${intStart};
+    for (var i = ${intFrom}; i < ${intTo}; i = i + 1u) {
 ${intBody()}
       wi = wi + 32u;
     }
     // The tail: the lanes whose vector still lies inside the row. Loads and adds only, so the
     // reductions after the branch are still reached by every lane.
-    if (wi < kVec) {
+    if (${tailGuard}) {
 ${intBody()}
     }
 ${accHandoff}
   } else {
     // The uncalibrated path, the round 1 f32 code dot, byte for byte in its accumulation order:
     // one word per lane, word lane + 32 i, whatever the vector width of the binding.
-    var w1 = lane;
     let kOnes = params.kWords / 32u;
-    for (var i = 0u; i < kOnes; i = i + 1u) {
+${floatBand}    var w1 = ${floatStart};
+    for (var i = ${floatFrom}; i < ${floatTo}; i = i + 1u) {
 ${floatBody()}
       w1 = w1 + 32u;
     }
@@ -541,6 +645,7 @@ ${stores}
   }
 }
 `;
+  return code;
 }
 
 /**
@@ -587,6 +692,7 @@ function qgemv2TileWgsl(variant: MatmulReduceVariant, geometry: Readonly<GemvGeo
     throw new Error(`qgemv-2bit reads sixteen row tiles, so rowsPerVsg must be 16, got ${geometry.rowsPerVsg}`);
   }
   if (inner === 'classic') throw new Error('qgemv-2bit has no classic loop on the interleaved layout');
+  const KS = kSplitsOf(geometry);
   const rows = Array.from({ length: 16 }, (_, r) => r);
   const pairs = Array.from({ length: 8 }, (_, m) => m);
   const comps = ['x', 'y', 'z', 'w'];
@@ -626,7 +732,7 @@ struct GemvParams {
   inScale: f32,
   // The module's output_activation_scale, applied to each written row. 0.0 means no rounding.
   outScale: f32,
-  pad1: u32,
+  upOffset: u32,
   pad2: u32,
 }
 
@@ -666,15 +772,24 @@ fn main(
   let tileBase = min(tile, lastTile) * params.kWords * 4u;
   // 32 lanes times 4 k per iteration: kWords * 16 / 128.
   let iters = params.kWords / 8u;
-${rows.map((r) => `  var acc${r} = 0.0;`).join('\n')}
+${KS === 1 ? '' : `  // This workgroup's slice of K. wid.z is the split and num_workgroups.z is the split
+  // count, so the cut needs no room in the params block.
+  let split = wid.z;
+  let per = (iters + ${KS - 1}u) / ${KS}u;
+  // kLo and kHi, not lo and hi: the integer path's flush block declares its own lo inside a
+  // nested scope, and two names one letter apart in the same function is how a shadowing bug
+  // gets written.
+  let kLo = min(split * per, iters);
+  let kHi = min(kLo + per, iters);
+`}${rows.map((r) => `  var acc${r} = 0.0;`).join('\n')}
   // Uniform branch: inScale comes from the uniform block.
   if (params.inScale != 0.0) {
 ${rows.map((r) => `    var acc${r}i: i32 = 0;`).join('\n')}
 ${pairs.map((m) => `    var p${m}: i32 = 0;`).join('\n')}
     var sx: i32 = 0;
-    var i = 0u;
-    while (i < iters) {
-      let stop = min(i + 16u, iters);
+    var i = ${KS === 1 ? '0u' : 'kLo'};
+    while (i < ${KS === 1 ? 'iters' : 'kHi'}) {
+      let stop = min(i + 16u, ${KS === 1 ? 'iters' : 'kHi'});
       for (; i < stop; i = i + 1u) {
         let v = wq[tileBase + i * 32u + lane];
         let xk = srqIn(${xr('i * 32u + lane')});
@@ -686,7 +801,7 @@ ${flush}
 ${rows.map((r) => `    acc${r} = f32(acc${r}i - 2 * sx);`).join('\n')}
   } else {
     var sxf = 0.0;
-    for (var i = 0u; i < iters; i = i + 1u) {
+    for (var i = ${KS === 1 ? '0u' : 'kLo'}; i < ${KS === 1 ? 'iters' : 'kHi'}; i = i + 1u) {
       let v = wq[tileBase + i * 32u + lane];
       let xk = ${xr('i * 32u + lane')};
 ${headBody}
@@ -700,10 +815,225 @@ ${rows.map((r) => `  let sum${r} = mmSum(acc${r}, lid);`).join('\n')}
   if (lane == 0u) {
     let xs = select(1.0, params.inScale, params.inScale != 0.0);
     let row0 = tile * 16u;
+${rows.map((r) => (KS === 1
+    ? `    if (row0 + ${r}u < params.numRows) { dst[row0 + ${r}u] = srqOut((xs * scales[row0 + ${r}u]) * sum${r}); }`
+    // The split cut is the LAST linear step: each partial carries its own row scale, so the merge
+    // has only a sum and srqOut left to do. That keeps the scales binding live and leaves the
+    // rounding of the scale multiply where the shipped kernel does it.
+    : `    if (row0 + ${r}u < params.numRows) { dst[(row0 + ${r}u) * ${KS}u + split] = (xs * scales[row0 + ${r}u]) * sum${r}; }`)).join('\n')}
+  }
+}
+`;
+}
+
+/**
+ * The 4-bit family's tile loop, the 2-bit tile16u trick at four bits, on an EIGHT row interleaved
+ * layout: rows grouped in tiles of eight, a tile holds K words, and word k of tile t carries the
+ * unsigned code (0..15, zero point 8) of row 8 t + r at bit offset 4 r. One 32 lane virtual
+ * subgroup owns one tile and the lanes deal K between them exactly as the 2-bit loop does: lane
+ * `lane` takes k = 4 lane + 128 i + j for j in 0..3 through one vec4<u32> load and one vec4
+ * activation load per iteration, so a word meets one scalar activation and the eight rows share
+ * it. The classic loop unpacks eight codes of ONE row per word and dots them against eight
+ * activations; here one word carries eight rows at ONE k, so the activation traffic per multiply
+ * add is an eighth and the unpack is a shift and a mask.
+ *
+ * The integer path: pair m of four, `(w >> 4m) & 0x000F000F`, is the unsigned codes of rows m and
+ * m + 4 in the two 16-bit halves of one u32, and one i32 multiply by the activation code forms
+ * both products at once. A product is at most 15 * 128 in magnitude. A BLOCK IS FOUR ITERATIONS,
+ * not the 2-bit loop's sixteen: four iterations add 16 products per half, 30720 at most, inside
+ * signed 16 bits for the low half (30720 < 32768) and inside i32 for the high one (30720 << 16 plus
+ * the low half is under 2^31). The split after each block sign extends the low half and takes it
+ * off before shifting the high one down, exact. The zero point comes off once per row at the end,
+ * sum((u - 8) x) being sum(u x) - 8 sum(x) with the lane's own activation code sum.
+ *
+ * The f32 path (an uncalibrated site; every 4-bit site in this checkpoint is calibrated, so it
+ * exists for the contract rather than for a tensor) reads the same words against the unsnapped
+ * activation with the zero point folded out the same way.
+ *
+ * No K split in this first cut: a split geometry is refused. K must be a multiple of 128 and the
+ * row count a multiple of nothing (a tile past the row count clamps its read and its rows fail
+ * the store guard), and every 4-bit linear in the text stack is 256, 1536, 2048 or 6144 rows,
+ * all whole tiles. This generator is priced on src/dev/gemvsweep.html?only=tile8 against the
+ * classic loop with a synthetic bank before anything is repacked to read it.
+ */
+function qgemv4TileWgsl(variant: MatmulReduceVariant, geometry: Readonly<GemvGeometry>, prologue: GemvPrologue = 'none'): string {
+  const xr = (expr: string): string => (prologue === 'gelu' ? `act(${expr})` : `x[${expr}]`);
+  const W = geometry.workgroupSize;
+  const tilesPerWg = W / 32;
+  if (geometry.rowsPerVsg !== 8) {
+    throw new Error(`qgemv-4bit tile8u reads eight row tiles, so rowsPerVsg must be 8, got ${geometry.rowsPerVsg}`);
+  }
+  if (kSplitsOf(geometry) !== 1) throw new Error('qgemv-4bit tile8u has no K split yet');
+  const FLUSH = 4;
+  const rows = Array.from({ length: 8 }, (_, r) => r);
+  const pairs = Array.from({ length: 4 }, (_, m) => m);
+  const comps = ['x', 'y', 'z', 'w'];
+  const shifted = (w: string, m: number): string => (m === 0 ? w : `(${w} >> ${4 * m}u)`);
+  const pairOps = (w: string, xj: string): string => pairs
+    .map((m) => `          p${m} = p${m} + i32(${shifted(w, m)} & 0x000F000Fu) * ${xj};`)
+    .join('\n');
+  const intBody = comps.map((c) => `        {\n          let w = v.${c};\n${pairOps('w', `xk.${c}`)}\n        }`).join('\n');
+  const flush = pairs
+    .map((m) => `      { let lo = (p${m} << 16u) >> 16u; acc${m}i = acc${m}i + lo; acc${m + 4}i = acc${m + 4}i + ((p${m} - lo) >> 16u); p${m} = 0; }`)
+    .join('\n');
+  const headBody = comps.map((c) => [
+    '      {',
+    `        let w = v.${c};`,
+    `        let xj = xk.${c};`,
+    '        sxf = sxf + xj;',
+    ...rows.map((r) => `        acc${r} = acc${r} + f32(${shifted('w', r)} & 15u) * xj;`),
+    '      }',
+  ].join('\n')).join('\n');
+
+  return /* wgsl */ `${matmulReducePrelude(variant, W)}
+struct GemvParams {
+  // Packed u32 words per weight row in the ROW layout, K / 8. The tile layout holds 8 kWords words
+  // per tile, which is K words, one per k.
+  kWords: u32,
+  // Unused on this kernel, which derives its iteration count from kWords.
+  kIters: u32,
+  numRows: u32,
+  pad0: u32,
+  inScale: f32,
+  outScale: f32,
+  upOffset: u32,
+  pad2: u32,
+}
+
+@group(0) @binding(0) var<storage, read> wq: array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read> scales: array<f32>;
+${prologueWgsl(prologue)}
+
+const SRQ_MAX: f32 = 127.0;
+const SRQ_MIN: f32 = -128.0;
+
+fn srqIn(v: vec4<f32>) -> vec4<i32> {
+  return vec4<i32>(clamp(round(v / params.inScale), vec4<f32>(SRQ_MIN), vec4<f32>(SRQ_MAX)));
+}
+
+fn srqOut(v: f32) -> f32 {
+  if (params.outScale == 0.0) {
+    return v;
+  }
+  return clamp(round(v / params.outScale), SRQ_MIN, SRQ_MAX) * params.outScale;
+}
+
+@compute @workgroup_size(${W})
+fn main(
+  @builtin(workgroup_id) wid: vec3<u32>,
+  @builtin(num_workgroups) nwg: vec3<u32>,
+  @builtin(local_invocation_index) lid: u32,
+) {
+  let lane = lid & 31u;
+  let vsg = lid >> 5u;
+  let group = wid.x + nwg.x * wid.y;
+  let tile = group * ${tilesPerWg}u + vsg;
+  let lastTile = (params.numRows - 1u) / 8u;
+  // A tile holds K words, which is kWords * 8 words or kWords * 2 vec4s.
+  let tileBase = min(tile, lastTile) * params.kWords * 2u;
+  // 32 lanes times 4 k per iteration: kWords * 8 / 128.
+  let iters = params.kWords / 16u;
+${rows.map((r) => `  var acc${r} = 0.0;`).join('\n')}
+  // Uniform branch: inScale comes from the uniform block.
+  if (params.inScale != 0.0) {
+${rows.map((r) => `    var acc${r}i: i32 = 0;`).join('\n')}
+${pairs.map((m) => `    var p${m}: i32 = 0;`).join('\n')}
+    var sx: i32 = 0;
+    var i = 0u;
+    while (i < iters) {
+      let stop = min(i + ${FLUSH}u, iters);
+      for (; i < stop; i = i + 1u) {
+        let v = wq[tileBase + i * 32u + lane];
+        let xk = srqIn(${xr('i * 32u + lane')});
+        sx = sx + xk.x + xk.y + xk.z + xk.w;
+${intBody}
+      }
+${flush}
+    }
+${rows.map((r) => `    acc${r} = f32(acc${r}i - 8 * sx);`).join('\n')}
+  } else {
+    var sxf = 0.0;
+    for (var i = 0u; i < iters; i = i + 1u) {
+      let v = wq[tileBase + i * 32u + lane];
+      let xk = ${xr('i * 32u + lane')};
+${headBody}
+    }
+    let sx8f = 8.0 * sxf;
+${rows.map((r) => `    acc${r} = acc${r} - sx8f;`).join('\n')}
+  }
+
+  // Both reductions above every store, in uniform control flow, then one guarded store block.
+${rows.map((r) => `  let sum${r} = mmSum(acc${r}, lid);`).join('\n')}
+  if (lane == 0u) {
+    let xs = select(1.0, params.inScale, params.inScale != 0.0);
+    let row0 = tile * 8u;
 ${rows.map((r) => `    if (row0 + ${r}u < params.numRows) { dst[row0 + ${r}u] = srqOut((xs * scales[row0 + ${r}u]) * sum${r}); }`).join('\n')}
   }
 }
 `;
+}
+
+/**
+ * The merge half of a split K GEMV: sum the S partials a row and apply the output snap.
+ *
+ * The split kernel already applied `inScale * scales[row]` to each partial, so all that is left
+ * here is a sum of S floats and srqOut. One lane a row, 64 a workgroup, so down_proj's 1536 rows
+ * are 24 workgroups and the pass is far below the timestamp clock on either machine.
+ *
+ * `params` is the same block gemvParams writes, with the split count in the slot the GEMV kernels
+ * do not read (u[3]).
+ */
+export function qgemvMergeWgsl(): string {
+  return /* wgsl */ `struct GemvParams {
+  kWords: u32,
+  kIters: u32,
+  numRows: u32,
+  kSplits: u32,
+  inScale: f32,
+  outScale: f32,
+  pad1: u32,
+  pad2: u32,
+}
+
+@group(0) @binding(0) var<storage, read> part: array<f32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(2) var<uniform> params: GemvParams;
+
+const SRQ_MAX: f32 = 127.0;
+const SRQ_MIN: f32 = -128.0;
+
+fn srqOut(v: f32) -> f32 {
+  if (params.outScale == 0.0) {
+    return v;
+  }
+  return clamp(round(v / params.outScale), SRQ_MIN, SRQ_MAX) * params.outScale;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let row = gid.x;
+  // Rows past the count sum a clamped base and are dropped by the store guard, the same shape the
+  // GEMV kernels use, so there is no early return above a store.
+  let r = min(row, params.numRows - 1u);
+  let base = r * params.kSplits;
+  var total = 0.0;
+  for (var s = 0u; s < params.kSplits; s = s + 1u) {
+    total = total + part[base + s];
+  }
+  if (row < params.numRows) {
+    dst[row] = srqOut(total);
+  }
+}
+`;
+}
+
+/** The one build, since this kernel has no geometry of its own. */
+export const QGEMV_MERGE_WGSL = qgemvMergeWgsl();
+
+/** The grid a split K GEMV dispatches: the folded row grid, with the split count on z. */
+export function foldedSplitDispatch(groups: number, splits: number): readonly [number, number, number] {
+  const [x, y] = foldedDispatch(groups);
+  return [x, y, splits];
 }
 
 /** The default geometry builds, which are what the Node checks read and the fallback table serves. */
@@ -809,6 +1139,59 @@ export function qgemvOracle(
  * the consuming linear's input scale (which stores the snapped values as that pass did), then
  * the GEMV oracle over them, which snaps again to the same codes. `k` is the activation width.
  */
+/**
+ * The CPU model of a split K dispatch and its merge, for the fold gate.
+ *
+ * It mirrors where the shader cuts: by ITERATION, not by k. One iteration of the 2-bit tile loop
+ * is 32 lanes by 4 k, so a split owns whole 128 wide bands of K and the last one may be short.
+ * Each split closes with the shipped `xs * scale * sum` and the merge sums those in f32 and
+ * applies the output snap once, which is the only place the arithmetic differs from `qgemvOracle`
+ * and the whole reason this is gated rather than argued.
+ */
+export function qgemvSplitOracle(
+  bits: GemvBits,
+  packed: Uint8Array,
+  scales: ArrayLike<number>,
+  x: Float32Array,
+  numRows: number,
+  k: number,
+  splits: number,
+  inScale = 0,
+  outScale = 0,
+): Float32Array {
+  if (bits !== 2) throw new Error(`qgemvSplitOracle models the 2-bit tile loop, got ${bits}`);
+  const kWords = wordsPerRow(bits, k);
+  const words = tile16ToRowWords(bytesAsWords(packed), numRows, k);
+  const calibrated = Number.isFinite(inScale) && inScale !== 0;
+  const xCodes = calibrated ? srqCodes(x.subarray(0, k), inScale) : null;
+  const xs = calibrated ? inScale : 1;
+  // The shader's own band arithmetic: iters = kWords / 8, per = ceil(iters / splits), and one
+  // iteration spans 128 of K.
+  const iters = Math.floor(kWords / 8);
+  const per = Math.ceil(iters / splits);
+  const out = new Float32Array(numRows);
+  for (let r = 0; r < numRows; r += 1) {
+    const rowWords = words.subarray(r * kWords, (r + 1) * kWords);
+    const codes = unpackWordsLikeShader(bits, rowWords, k);
+    const rawScale = Number(scales[r] ?? 0);
+    const scale = Number.isFinite(rawScale) ? rawScale : 0;
+    let total = 0;
+    for (let sIdx = 0; sIdx < splits; sIdx += 1) {
+      const lo = Math.min(sIdx * per, iters) * 128;
+      const hi = Math.min(Math.min(sIdx * per, iters) + per, iters) * 128;
+      let sum = 0;
+      if (xCodes) {
+        for (let i = lo; i < hi; i += 1) sum += codes[i] * xCodes[i];
+      } else {
+        for (let i = lo; i < hi; i += 1) sum += codes[i] * x[i];
+      }
+      total = Math.fround(total + Math.fround(Math.fround(xs * scale) * Math.fround(sum)));
+    }
+    out[r] = total;
+  }
+  return applySrq(out, Number.isFinite(outScale) ? outScale : 0, undefined, out);
+}
+
 export function qgemvGeluOracle(
   bits: GemvBits,
   packed: Uint8Array,
@@ -846,6 +1229,8 @@ export function gemvParams(
   numRows: number,
   inScale = 0,
   outScale = 0,
+  kSplits = 1,
+  upOffset = 0,
 ): ArrayBuffer {
   const buf = new ArrayBuffer(32);
   const u = new Uint32Array(buf);
@@ -853,10 +1238,12 @@ export function gemvParams(
   u[0] = kWords;
   u[1] = kIters;
   u[2] = numRows;
-  u[3] = 0;
+  // The split count, read by the merge kernel alone. The GEMV kernels take their split from
+  // wid.z and never look here, so an unsplit dispatch writes the 0 it always wrote.
+  u[3] = kSplits === 1 ? 0 : kSplits;
   f[4] = inScale;
   f[5] = outScale;
-  u[6] = 0;
+  u[6] = upOffset;
   u[7] = 0;
   return buf;
 }
@@ -868,7 +1255,7 @@ export function foldedDispatch(groups: number): readonly [number, number, number
   return [x, Math.ceil(groups / x), 1];
 }
 
-function bindGemv(bits: GemvBits, prologue: GemvPrologue = 'none') {
+export function bindGemv(bits: GemvBits, prologue: GemvPrologue = 'none', split = false, geometryOverride?: () => Readonly<GemvGeometry>) {
   return (input: KernelBindInput): KernelBindResult => {
     const { device, inputs, output, params } = input;
     const k = params.k | 0;
@@ -889,8 +1276,12 @@ function bindGemv(bits: GemvBits, prologue: GemvPrologue = 'none') {
     // Whole iterations at the active geometry's words per lane; the shader's guarded tail takes
     // the remainder (qgemvWgsl). kWords is a multiple of the lane vector width because K is a
     // multiple of K_SPAN_PER_ITER, which is at least 8 words at every legal width.
-    const geometry = gemvGeometry(bits);
+    const geometry = geometryOverride?.() ?? gemvGeometry(bits);
     const kIters = Math.floor(kWords / (32 * geometry.wordsPerLane));
+    // The K split, on the 2-bit tile loop and on the classic 4-bit and 8-bit loops. It rides on
+    // z, so a split dispatch is the same grid with a third dimension and an unsplit one is the
+    // grid it always was; only a kernel named for the split reads it.
+    const kSplits = split ? kSplitsOf(geometry) : 1;
     const wq = inputs.wq;
     const scales = inputs.scales;
     if (!wq || !scales) throw new Error('qgemv needs inputs named wq and scales');
@@ -918,13 +1309,13 @@ function bindGemv(bits: GemvBits, prologue: GemvPrologue = 'none') {
     const uniform = kernelUniform(
       input,
       `${name} params`,
-      gemvParams(kWords, kIters, numRows, inScale, outScale),
+      gemvParams(kWords, kIters, numRows, inScale, outScale, kSplits, params.upOffset ?? 0),
     );
 
     return {
       layout,
       buffers: [wq, scales, ...activations, output, uniform.binding],
-      dispatch: foldedDispatch(Math.ceil(numRows / gemvRowsPerWorkgroup(geometry))),
+      dispatch: foldedSplitDispatch(Math.ceil(numRows / gemvRowsPerWorkgroup(geometry)), kSplits),
       dispose: uniform.dispose,
     };
   };
@@ -954,6 +1345,87 @@ const SRQ_IN_THIRDS = 0.1875;
 const SRQ_IN_CLAMPING = 0.015625;
 /** The output scale of the rounding cases, kept in the fixture builder's measured margin. */
 const SRQ_OUT = 0.0625;
+
+/**
+ * The merge half of a split K GEMV, as a registry kernel.
+ *
+ * It exists only when a device profile asks for `kSplits` on the 2-bit family. The split build
+ * writes `numRows * kSplits` partials that already carry their row scale, and this sums the
+ * kSplits of each row and applies the output snap. One lane a row, 64 a workgroup, so down_proj's
+ * 1536 rows are 24 workgroups.
+ *
+ * WHY IT IS WORTH A SECOND DISPATCH. down_proj is 1536 rows by K 12288, which at 16 rows a
+ * workgroup is 96 workgroups; its siblings gate and up are the transpose and so 768. On the 5070
+ * that costs 3.9x on identical bytes, 0.042141 ms against 0.010806, and kSplits 8 recovers it to
+ * 0.011879 including this pass, which is within 10 percent of the sibling that never had the
+ * problem (lab-results/5070-downproj-shape-vs-prologue-sep04.json). The merge itself is 1.2 us of
+ * that 11.9, about a tenth, and it buys the other 280 percent.
+ */
+export const qgemvMergeKernel: Kernel = {
+  name: 'qgemv-merge',
+  get wgsl(): string { return QGEMV_MERGE_WGSL; },
+  entry: 'main',
+  note:
+    'The fold of a split K GEMV. No subgroup operations and no workgroup memory, so the one build '
+    + 'serves both reduce policies and it is deliberately absent from the fallback table, whose '
+    + 'entries all differ from their registry build by design.',
+  cases: [
+    {
+      name: 'fold-8x4',
+      inputs: { part: 'kmm.merge.part' },
+      expected: 'kmm.merge.expected',
+      params: { numRows: 8, kSplits: 4, outScale: SRQ_OUT },
+      tolAbs: 0,
+      tolUlp: 0,
+      note:
+        'Four partials a row, already carrying their row scale as the split build writes them, '
+        + 'summed in the order the shader sums them and snapped once. Zero tolerance: the fold is '
+        + 'three f32 adds and one srqOut, and the fixture is built by the same applySrq the '
+        + 'shader mirrors.',
+    },
+    {
+      name: 'fold-8x4-uncalibrated',
+      inputs: { part: 'kmm.merge.part' },
+      expected: 'kmm.merge.raw.expected',
+      params: { numRows: 8, kSplits: 4, outScale: 0 },
+      tolAbs: 0,
+      tolUlp: 0,
+      note:
+        'The same partials with outScale 0.0, the uncalibrated site, where the fold is the sum '
+        + 'and nothing else. This is the case that would catch a shader applying the snap '
+        + 'unconditionally.',
+    },
+  ],
+  bind: (input: KernelBindInput): KernelBindResult => {
+    const { device, inputs, output, params } = input;
+    const numRows = params.numRows | 0;
+    const kSplits = params.kSplits | 0;
+    if (numRows <= 0) throw new Error('qgemv-merge needs a positive params.numRows');
+    if (kSplits < 2) {
+      throw new Error(`qgemv-merge only exists on a split dispatch, got kSplits ${kSplits}`);
+    }
+    const part = inputs.part;
+    if (!part) throw new Error('qgemv-merge needs an input named part');
+    const layout = kernelLayout(input, 'qgemv-merge', () => device.createBindGroupLayout({
+      label: 'qgemv-merge',
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+      ],
+    }));
+    // kWords and kIters mean nothing to this kernel; it reads numRows, kSplits and outScale.
+    const uniform = kernelUniform(input, 'qgemv-merge params', gemvParams(
+      0, 0, numRows, params.inScale ?? 0, params.outScale ?? 0, kSplits,
+    ));
+    return {
+      layout,
+      buffers: [part, output, uniform.binding],
+      dispatch: foldedDispatch(Math.ceil(numRows / 64)),
+      dispose: uniform.dispose,
+    };
+  },
+};
 
 export const qgemv4Kernel: Kernel = {
   name: 'qgemv-4bit',
@@ -1025,7 +1497,7 @@ export const qgemv4Kernel: Kernel = {
 
 export const qgemv2Kernel: Kernel = {
   name: 'qgemv-2bit',
-  get wgsl(): string { return qgemvWgsl(2, 'subgroup'); },
+  get wgsl(): string { return qgemvWgsl(2, 'subgroup', unsplitGemvGeometry(gemvGeometry(2))); },
   entry: 'main',
   note:
     'K5 and K13. Fused 2-bit dequant GEMV, unpack written for instruction count because the 2-bit '
@@ -1154,7 +1626,7 @@ const GELU_F32_TOL_ABS = 1e-3;
 
 export const qgemv4GeluKernel: Kernel = {
   name: GEMV_GELU_KERNEL[4],
-  wgsl: QGEMV4_GELU_WGSL,
+  get wgsl(): string { return qgemvWgsl(4, 'subgroup', gemvGeometry(4), 'gelu'); },
   entry: 'main',
   note: 'K16 with the K10 prologue: gelu(gate) * up read in place of x. The decode down_proj of the 4-bit layers.',
   cases: [
@@ -1184,7 +1656,7 @@ export const qgemv4GeluKernel: Kernel = {
 
 export const qgemv2GeluKernel: Kernel = {
   name: GEMV_GELU_KERNEL[2],
-  wgsl: QGEMV2_GELU_WGSL,
+  get wgsl(): string { return qgemvWgsl(2, 'subgroup', unsplitGemvGeometry(gemvGeometry(2)), 'gelu'); },
   entry: 'main',
   note: 'The tile GEMV with the K10 prologue. The decode down_proj of the 2-bit layers.',
   cases: [
@@ -1201,12 +1673,95 @@ export const qgemv2GeluKernel: Kernel = {
   bind: bindGemv(2, 'gelu'),
 };
 
+/**
+ * The split K sibling of the entry above, and the only 2-bit GEMV that is allowed to dispatch a z
+ * greater than one. The plan emits this name in place of `qgemv-2bit-gelu` exactly when it also
+ * emits ROLE_DOWN_MERGE, so the partials it writes are always folded.
+ *
+ * Its case is the unsplit sibling's, run at the shipped geometry where kSplits is 1 and the split
+ * build collapses to the text the sibling compiles: that proves the collapse and nothing more. The
+ * split builds at 2, 4 and 8 are proved directly against qgemvSplitOracle by the split K block in
+ * scripts/engine-check/k-matmul.mjs, which drives the WGSL at an explicit geometry rather than
+ * through a registry case, because a case runs at whatever geometry is active.
+ */
+export const qgemv2GeluSplitKernel: Kernel = {
+  name: GEMV_GELU_SPLIT_KERNEL_2BIT,
+  get wgsl(): string { return qgemvWgsl(2, 'subgroup', gemvGeometry(2), 'gelu'); },
+  entry: 'main',
+  note: 'The split K decode down_proj of the 2-bit layers. Writes partials; the plan folds them.',
+  cases: [
+    {
+      name: 'synthetic-8x1024-gelu-srq-unsplit',
+      inputs: { wq: 'kmm.gemv2.tile.wq', scales: 'kmm.gemv2.scales', gate: 'kmm.gelu.gate1024', up: 'kmm.gelu.up1024' },
+      expected: 'kmm.gemv2.gelu.srq.expected',
+      params: { k: 1024, numRows: 8, inScale: SRQ_IN_THIRDS, outScale: SRQ_OUT },
+      tolAbs: 0,
+      tolUlp: 0,
+      note: 'At kSplits 1 the split build is the unsplit build, so it owes the same answer exactly.',
+    },
+  ],
+  bind: bindGemv(2, 'gelu', true),
+};
+
+/**
+ * The split K builds of the classic loops (GEMV_SPLIT_KERNEL). Each carries the unsplit case:
+ * at kSplits 1 the split build is the plain build to the byte, so it owes the same answer
+ * exactly; the split itself is held to the k-matmul text checks and to parity, as the 2-bit
+ * split is. Their fold lives in the consumer (kernels/attnPrologue.ts), never in a merge.
+ */
+export const qgemv4SplitKernel: Kernel = {
+  name: GEMV_SPLIT_KERNEL[4],
+  get wgsl(): string { return qgemvWgsl(4, 'subgroup', gemvGeometry(4), 'none', true); },
+  entry: 'main',
+  note: 'The split K decode q, k and v projections of the 4-bit family. Writes partials; the fused attention prologue folds them.',
+  cases: [
+    {
+      name: 'synthetic-8x512-unsplit',
+      inputs: { wq: 'kmm.gemv4.wq', scales: 'kmm.gemv4.scales', x: 'kmm.x512' },
+      expected: 'kmm.gemv4.expected',
+      params: { k: 512, numRows: 8 },
+      tolAbs: 0,
+      tolUlp: 0,
+      note: 'At kSplits 1 the split build is the plain build, so it owes the same answer exactly.',
+    },
+  ],
+  bind: bindGemv(4, 'none', true),
+};
+
+export const qgemv8SplitKernel: Kernel = {
+  name: GEMV_SPLIT_KERNEL[8],
+  get wgsl(): string { return qgemvWgsl(8, 'subgroup', gemvGeometry(8), 'none', true); },
+  entry: 'main',
+  note: 'The split K decode per_layer_input_gate of the I8 family. Writes partials; the per layer projection folds them in its prologue.',
+  cases: [
+    {
+      name: 'synthetic-10x256-unsplit',
+      inputs: { wq: 'kple.qm8.wq', scales: 'kple.qm8.scales', x: 'kple.qm8.x' },
+      expected: 'kple.qgemv8.expected',
+      params: { k: 256, numRows: 10 },
+      tolAbs: 0,
+      tolUlp: 0,
+      note: 'At kSplits 1 the split build is the plain build, so it owes the same answer exactly.',
+    },
+  ],
+  bind: bindGemv(8, 'none', true),
+};
+
 export const qgemv8GeluKernel: Kernel = {
   name: GEMV_GELU_KERNEL[8],
-  wgsl: QGEMV8_GELU_WGSL,
+  get wgsl(): string { return qgemvWgsl(8, 'subgroup', gemvGeometry(8), 'gelu'); },
   entry: 'main',
   note: 'The I8 GEMV with the K10 prologue. The decode per_layer_projection, over gelu(gate) times the per layer row.',
   cases: [
+    {
+      name: 'synthetic-10x256-gelu-offset-row34',
+      inputs: { wq: 'kple.qm8.wq', scales: 'kple.qm8.scales', gate: 'kple.gelu.gate256', up: 'kple.gelu.up35x256' },
+      expected: 'kple.qgemv8.gelu.srq.expected',
+      params: { k: 256, numRows: 10, inScale: SRQ_IN_THIRDS, outScale: SRQ_OUT, upOffset: 34 * 64 },
+      tolAbs: 0,
+      tolUlp: 0,
+      note: 'Reads the final layer row in place. Every preceding row contains a deliberately different value.',
+    },
     {
       name: 'synthetic-10x256-gelu-srq',
       inputs: { wq: 'kple.qm8.wq', scales: 'kple.qm8.scales', gate: 'kple.gelu.gate256', up: 'kple.gelu.up256' },

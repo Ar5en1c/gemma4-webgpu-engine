@@ -135,19 +135,24 @@ export interface Kernel {
 // And one budget: the M1 Chrome adapter caps maxStorageBuffersPerShaderStage at 10 and requesting
 // more is impossible (DECODE-CAMPAIGN.md 4.7). The harness counts every kernel's bindings against
 // the live limit on each run, so the budget is checked rather than remembered.
+import { pleGateSplitKernel, pleFoldProjectionKernel } from './pleSplit';
+import { exactSplitKernel, exactMergeKernel } from './exactSplit';
 import { scaleAddKernel } from './scaleAdd';
 import { rmsNormKernel, rmsNormWeightlessKernel } from './rmsNorm';
 import { ropeKernel } from './rope';
 import { embedTokensGatherKernel, pleGatherKernel, pleGatherSlicedKernel } from './embedGather';
-import { qgemv2Kernel, qgemv4Kernel, qgemv8Kernel, qgemv4GeluKernel, qgemv2GeluKernel, qgemv8GeluKernel } from './qgemv';
+import { qkvBatchKernel, gateUpBatch4Kernel, gateUpBatch2Kernel } from './projectionBatch';
+import { qgemv2Kernel, qgemv4Kernel, qgemv8Kernel, qgemv4GeluKernel, qgemv2GeluKernel, qgemv8GeluKernel, qgemv2GeluSplitKernel, qgemvMergeKernel, qgemv4SplitKernel, qgemv8SplitKernel } from './qgemv';
 import {
   qgemv2WideKernel, qgemv4WideKernel, qgemv8WideKernel, qgemv4GeluWideKernel, qgemv2GeluWideKernel, qgemv8GeluWideKernel,
+  qgemv2GeluSplitWideKernel,
 } from './qgemvWide';
+import { qNormRopeKernel, kvPrologueKernel, qNormRopeFoldKernel, kvPrologueFoldKernel } from './attnPrologue';
 import { qgemm2Kernel, qgemm4Kernel } from './qgemm';
 import { qmatmul8Kernel } from './pleMatmul';
 import { denseMatmulKernel } from './denseMatmul';
 import { argmaxFinalKernel, argmaxPartialKernel } from './argmax';
-import { attentionDecodeKernel, attentionPrefillKernel } from './attention';
+import { attentionDecodeKernel, attentionPrefillKernel, attentionDecodeSplitKernel, attentionMergeKernel } from './attention';
 import { kvCacheStoreKernel } from './kvStore';
 import { geluMulKernel } from './geluMul';
 import { normResidualKernel } from './mlpEpilogue';
@@ -177,17 +182,32 @@ export const KERNELS: Kernel[] = [
   // bandwidth goes on the M1 (DECODE-CAMPAIGN.md 1) and therefore where the engine's performance
   // lives. Checked by scripts/engine-check/k-matmul.mjs.
   qgemv4Kernel,
+  exactSplitKernel, exactMergeKernel,
+  pleGateSplitKernel, pleFoldProjectionKernel,
+  qkvBatchKernel, gateUpBatch4Kernel, gateUpBatch2Kernel,
   qgemv2Kernel,
   qgemm4Kernel,
   qgemm2Kernel,
   qgemv4GeluKernel,
   qgemv2GeluKernel,
+  qgemv2GeluSplitKernel,
+  // Only reachable on a device profile that asks for kSplits; unreferenced by the plan otherwise.
+  qgemvMergeKernel,
   qgemv8GeluKernel,
   qgemv4WideKernel,
   qgemv2WideKernel,
   qgemv8WideKernel,
   qgemv4GeluWideKernel,
   qgemv2GeluWideKernel,
+  qgemv2GeluSplitWideKernel,
+  qNormRopeKernel,
+  kvPrologueKernel,
+  // The 4-bit attention split and its fold, only reachable on a geometry that asks for kSplits
+  // on the 4-bit family; the 8-bit split is registered for the PLE gate's turn.
+  qgemv4SplitKernel,
+  qgemv8SplitKernel,
+  qNormRopeFoldKernel,
+  kvPrologueFoldKernel,
   qgemv8GeluWideKernel,
   repack2Kernel,
   // The per layer embedding path's own two matmul families, K12, which round 1 did not plan and
@@ -211,6 +231,9 @@ export const KERNELS: Kernel[] = [
   // asserted against the reference capture by scripts/engine-check/k-attention.mjs.
   kvCacheStoreKernel,
   attentionDecodeKernel,
+  attentionDecodeSplitKernel,
+  // Only reachable on a device profile that asks for kvSplits; unreferenced by the plan otherwise.
+  attentionMergeKernel,
   attentionPrefillKernel,
   // The MLP and glue family, K10, K11 and K14, plus the storage cast pair. The gated activation is
   // gelu_pytorch_tanh, which config.json names and scripts/engine-check/k-mlp.mjs asserts against

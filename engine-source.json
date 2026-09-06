@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/Ar5en1c/purrview",
+  "revision": "73fb4d2b508dabbfc30bd00136b97a8511c74937",
+  "directory": "src/engine/gemma4",
+  "excludes": [
+    "dev"
+  ],
+  "syncedOn": "2026-09-06"
+}

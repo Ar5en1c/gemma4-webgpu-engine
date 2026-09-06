@@ -5,6 +5,7 @@
 // measured here in the page, and the prompts are fixed so two devices can be compared.
 
 import { Gemma4Mobile, DEFAULT_MODEL_ID } from '../src/index';
+import engineSource from '../engine-source.json';
 import { REQUESTED_LIMITS } from '../src/device';
 import type { Gemma4Message, Gemma4Progress } from '../src/index';
 import { smokeTest, allocationLadder, hostMemoryLadder, type SmokeResult, type AllocResult } from './probe';
@@ -66,7 +67,7 @@ declare const __BUILD_AT__: string;
 
 interface Result {
   /** Which build produced this. A pasted result with no build is a stale page. */
-  build: { id: string; at: string };
+  build: { id: string; at: string; engineSource: string };
   /** FAILED means do not quote any number below it. See `failures`. */
   verdict: 'ok' | 'FAILED';
   failures: string[];
@@ -366,7 +367,7 @@ async function bench(adapterInfo: Record<string, unknown> | null): Promise<void>
     // A refused load is the most informative result this page can produce, so it must be
     // pasteable. Before this, the guard fired and the page handed back nothing to copy.
     result = {
-      build: { id: __BUILD_ID__, at: __BUILD_AT__ },
+      build: { id: __BUILD_ID__, at: __BUILD_AT__, engineSource: engineSource.revision },
       verdict: 'FAILED',
       failures: [`the model refused to load: ${String(err)}`],
       measuredAt: new Date().toISOString(),
@@ -466,7 +467,7 @@ async function bench(adapterInfo: Record<string, unknown> | null): Promise<void>
       + `${loadBytes.totalBytes} bytes, so the weights are incomplete`);
   }
   result = {
-    build: { id: __BUILD_ID__, at: __BUILD_AT__ },
+    build: { id: __BUILD_ID__, at: __BUILD_AT__, engineSource: engineSource.revision },
     verdict: failures.length === 0 ? 'ok' : 'FAILED',
     failures,
     measuredAt: new Date().toISOString(),
@@ -656,7 +657,7 @@ function recoverPreviousRun(): void {
     button.style.cssText = 'margin-top:.6rem';
     button.addEventListener('click', () => {
       void navigator.clipboard.writeText(JSON.stringify({
-        build: { id: __BUILD_ID__, at: __BUILD_AT__ },
+        build: { id: __BUILD_ID__, at: __BUILD_AT__, engineSource: engineSource.revision },
         userAgent: navigator.userAgent,
         note: 'the previous run on this device did not finish',
         trail: previous,

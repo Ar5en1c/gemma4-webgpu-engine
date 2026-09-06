@@ -24,15 +24,22 @@
 //  - One reduction shape per variant, engine wide. A kernel is never mixed and matched.
 
 import { createComputePipelineChecked, withErrorScopes, type Gemma4Device } from './device';
+import { pleGateSplitWgsl, pleFoldProjectionWgsl } from './kernels/pleSplit';
+import { exactSplitWgsl } from './kernels/exactSplit';
+import { projectionBatchWgsl } from './kernels/projectionBatch';
 import { kernelByName, type Kernel } from './kernels/registry';
 import { SUBGROUP_SELFTEST_WGSL, subgroupSelfTestExpected } from './kernels/subgroupReduce';
 import type { MatmulReduceVariant } from './kernels/qgemv';
-import { qgemvWgsl } from './kernels/qgemv';
-import { gemvWideKernelName, qgemvWideWgsl } from './kernels/qgemvWide';
+import { qgemvWgsl, gemvGeometry, unsplitGemvGeometry, GEMV_GELU_SPLIT_KERNEL_2BIT, GEMV_SPLIT_KERNEL } from './kernels/qgemv';
+import { gemvWideKernelName, qgemv2GeluSplitWideFallbackWgsl, qgemvWideWgsl } from './kernels/qgemvWide';
 import { QGEMM4_FALLBACK_WGSL } from './kernels/qgemm';
 import { RMS_NORM_FALLBACK_WGSL, RMS_NORM_WEIGHTLESS_FALLBACK_WGSL } from './kernels/rmsNorm';
+import {
+  KV_PROLOGUE_FALLBACK_WGSL, KV_PROLOGUE_FOLD_KERNEL, KV_PROLOGUE_KERNEL, Q_NORM_ROPE_FALLBACK_WGSL, Q_NORM_ROPE_FOLD_KERNEL, Q_NORM_ROPE_KERNEL,
+  kvPrologueFoldFallbackWgsl, qNormRopeFoldFallbackWgsl,
+} from './kernels/attnPrologue';
 import { ARGMAX_FINAL_FALLBACK_WGSL, ARGMAX_PARTIAL_FALLBACK_WGSL } from './kernels/argmax';
-import { attentionWgsl } from './kernels/attention';
+import { attentionWgsl, attentionGeometry, unsplitAttentionGeometry, ATTENTION_DECODE_SPLIT_KERNEL } from './kernels/attention';
 import { NORM_RESIDUAL_FALLBACK_WGSL } from './kernels/mlpEpilogue';
 import { NORM_RESIDUAL_NORM_FALLBACK_WGSL } from './kernels/blockJoin';
 
@@ -46,17 +53,33 @@ export type ReduceVariant = MatmulReduceVariant; // 'subgroup' | 'workgroup'
  * rather than shipping a subgroup kernel to a device that failed the self test.
  */
 export const FALLBACK_WGSL: Readonly<Record<string, string>> = Object.freeze({
+  get 'qkv-batch-4bit'(): string { return projectionBatchWgsl(4, 3, 'workgroup'); },
+  get 'gate-up-batch-4bit'(): string { return projectionBatchWgsl(4, 2, 'workgroup'); },
+  get 'gate-up-batch-2bit'(): string { return projectionBatchWgsl(2, 2, 'workgroup'); },
+  get 'qgemv-4bit-gelu-exact-split'(): string { return exactSplitWgsl('workgroup'); },
+  get 'ple-gate-split'(): string { return pleGateSplitWgsl('workgroup'); },
+  get 'ple-fold-projection'(): string { return pleFoldProjectionWgsl('workgroup'); },
   'rms-norm': RMS_NORM_FALLBACK_WGSL,
   'rms-norm-weightless': RMS_NORM_WEIGHTLESS_FALLBACK_WGSL,
+  // The fused attention prologue reduces through the norm kernel's own pieces, so its portable
+  // build is the norm's workgroup tree (kernels/attnPrologue.ts).
+  [Q_NORM_ROPE_KERNEL]: Q_NORM_ROPE_FALLBACK_WGSL,
+  [KV_PROLOGUE_KERNEL]: KV_PROLOGUE_FALLBACK_WGSL,
   // Read at build time against the active decode GEMV geometry (qgemv.ts setGemvGeometry), the
   // same way the registry entries read theirs, so the performance rig's sweep compiles the
   // portable build of the geometry under test too. At the default geometry these are the
   // QGEMV4_FALLBACK_WGSL and QGEMV2_FALLBACK_WGSL constants byte for byte.
   get 'qgemv-4bit'(): string { return qgemvWgsl(4, 'workgroup'); },
-  get 'qgemv-2bit'(): string { return qgemvWgsl(2, 'workgroup'); },
+  get 'qgemv-2bit'(): string { return qgemvWgsl(2, 'workgroup', unsplitGemvGeometry(gemvGeometry(2))); },
   get 'qgemv-8bit'(): string { return qgemvWgsl(8, 'workgroup'); },
   get 'qgemv-4bit-gelu'(): string { return qgemvWgsl(4, 'workgroup', undefined, 'gelu'); },
-  get 'qgemv-2bit-gelu'(): string { return qgemvWgsl(2, 'workgroup', undefined, 'gelu'); },
+  get 'qgemv-2bit-gelu'(): string { return qgemvWgsl(2, 'workgroup', unsplitGemvGeometry(gemvGeometry(2)), 'gelu'); },
+  // The split siblings read the live geometry, which is the whole point of them.
+  get [GEMV_GELU_SPLIT_KERNEL_2BIT](): string { return qgemvWgsl(2, 'workgroup', gemvGeometry(2), 'gelu'); },
+  get [GEMV_SPLIT_KERNEL[4]](): string { return qgemvWgsl(4, 'workgroup', gemvGeometry(4), 'none', true); },
+  get [GEMV_SPLIT_KERNEL[8]](): string { return qgemvWgsl(8, 'workgroup', gemvGeometry(8), 'none', true); },
+  get [Q_NORM_ROPE_FOLD_KERNEL](): string { return qNormRopeFoldFallbackWgsl(); },
+  get [KV_PROLOGUE_FOLD_KERNEL](): string { return kvPrologueFoldFallbackWgsl(); },
   get 'qgemv-8bit-gelu'(): string { return qgemvWgsl(8, 'workgroup', undefined, 'gelu'); },
   // Keyed off gemvWideKernelName rather than written out, because the wide family's column count
   // is a measured constant (GEMV_WIDE_COLS) and round 7 moved it from four to two. Spelling the
@@ -68,6 +91,8 @@ export const FALLBACK_WGSL: Readonly<Record<string, string>> = Object.freeze({
   get [gemvWideKernelName(4, 'gelu')](): string { return qgemvWideWgsl(4, 'workgroup', undefined, 'gelu'); },
   get [gemvWideKernelName(2, 'gelu')](): string { return qgemvWideWgsl(2, 'workgroup', undefined, 'gelu'); },
   get [gemvWideKernelName(8, 'gelu')](): string { return qgemvWideWgsl(8, 'workgroup', undefined, 'gelu'); },
+  // The wide split sibling reads the live geometry, as the one column split above does.
+  get [gemvWideKernelName(2, 'gelu', true)](): string { return qgemv2GeluSplitWideFallbackWgsl(); },
   'qgemm-4bit': QGEMM4_FALLBACK_WGSL,
   // qgemm-2bit reduces nothing (a lane per output row) and has one build under both policies.
   'argmax-partial': ARGMAX_PARTIAL_FALLBACK_WGSL,
@@ -76,8 +101,9 @@ export const FALLBACK_WGSL: Readonly<Record<string, string>> = Object.freeze({
   // so both map to the same fallback build. Read at build time against the active attention
   // geometry (attention.ts setAttentionGeometry) for the same reason as the GEMV entries above;
   // at the default geometry this is the ATTENTION_FALLBACK_WGSL constant byte for byte.
-  get 'attention-decode'(): string { return attentionWgsl('workgroup'); },
-  get 'attention-prefill'(): string { return attentionWgsl('workgroup'); },
+  get 'attention-decode'(): string { return attentionWgsl('workgroup', unsplitAttentionGeometry(attentionGeometry())); },
+  get 'attention-prefill'(): string { return attentionWgsl('workgroup', unsplitAttentionGeometry(attentionGeometry())); },
+  get [ATTENTION_DECODE_SPLIT_KERNEL](): string { return attentionWgsl('workgroup'); },
   'norm-residual': NORM_RESIDUAL_FALLBACK_WGSL,
   'norm-residual-norm': NORM_RESIDUAL_NORM_FALLBACK_WGSL,
 });
@@ -235,7 +261,9 @@ export class PipelineStore {
       compute: { module: this.moduleFor(kernel.name, code), entryPoint: kernel.entry },
     });
     if (!pipeline) {
-      throw new Error(`PipelineStore: ${kernelName} failed to build under ${this.variant}: ${error ?? 'no message'}`);
+      const info = await this.moduleFor(kernel.name, code).getCompilationInfo();
+      const diagnostics = info.messages.map(m => `${m.lineNum}:${m.linePos} ${m.message}`).join('\n');
+      throw new Error(`PipelineStore: ${kernelName} failed to build under ${this.variant}: ${error ?? 'no message'}\n${diagnostics}`);
     }
     const built: BuiltPipeline = { kernel, variant: this.variant, pipeline };
     this.pipelines.set(kernelName, built);
