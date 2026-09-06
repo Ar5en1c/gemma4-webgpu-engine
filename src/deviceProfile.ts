@@ -430,22 +430,20 @@ const M1_PROFILE: Gemma4DeviceProfile = {
     attentionVAccumulators: {
       value: 1,
       tuningReason:
-        'the shipped chain. The kernel bench puts 4 accumulators at 1.14x to 1.26x here across '
-        + 'four contexts and the model page confirms the token ids do not move, but the end to '
-        + 'end rate has not been resolved: the control on this machine moved seven percent '
-        + 'between two builds of the same default path, and the claimed gain sat inside that. It '
-        + 'moves when a five round family says it should, not before '
-        + '(lab-results/m1-downproj-ksplit-in-situ-sep04.json, methodCorrection).',
+        'Retain the shipped reduction order. September 6 end-to-end V=4 changes generated IDs '
+        + 'on all three M1 prompts. The older model-page record checked tokenizer IDs, not '
+        + 'generated output parity. See lab-results/m1-decode-sep06.json.',
     },
     attentionScoreAccumulators: {
       value: 4,
       tuningReason:
-        'the shipped text. Round 5 measured four accumulators against one on this machine and '
-        + 'kept four; 8 and 16 exist for the 5070 and have not been run here.',
+        'Retain four accumulators. September 6 paired M1 measurements of eight change generated '
+        + 'IDs on all three prompts and show no consistent speed gain; see '
+        + 'lab-results/m1-decode-sep06.json. Sixteen remains unmeasured here.',
     },
     attentionScoreLayout: {
       value: 'rows',
-      tuningReason: 'the shipped loop. The dims layout was built for the 5070 and has not been run here.',
+      tuningReason: 'The shipped loop. The dims layout was built for the 5070 and has not been run here.',
     },
     decodeGemv2KSplits: {
       value: 1,
@@ -455,17 +453,23 @@ const M1_PROFILE: Gemma4DeviceProfile = {
         + 'bench that predicted a win was wrong by 3.7x in the other direction. 8 cores cannot '
         + 'use the workgroups a split creates.',
     },
-    decodeBatch2WorkgroupWidth: { value: 32, tuningReason: 'Retain the existing 2-bit producer width outside the measured Blackwell profile.' },
-    decodeBatchProjections: { value: false, tuningReason: 'Not measured on this device family; retain separate projections.' },
-    decodeProducerDownKSplits: { value: 1, tuningReason: 'Not measured on this device family; retain the original producer down dot.' },
-    decodePleGateKSplits: { value: 1, tuningReason: 'Not measured on this device family; retain the original PLE gate dot.' },
+    decodeBatch2WorkgroupWidth: { value: 32, tuningReason: 'The September 6 M1 paired 32 versus 64 comparison did not establish a consistent advantage for 64. Retain 32; see lab-results/m1-decode-sep06.json.' },
+    decodeBatchProjections: {
+      value: true,
+      tuningReason:
+        'Measured on the 8-core Apple M1 with Chrome 152, September 6: independent Q/K/V and '
+        + 'gate/up batching preserves the control token IDs and improves paired decode throughput. '
+        + 'Keep the existing 32-thread width. See lab-results/m1-decode-sep06.json. Other Apple '
+        + 'chips share this profile but their performance has not been measured.',
+    },
+    decodeProducerDownKSplits: { value: 1, tuningReason: 'September 6 paired M1 testing of the exact integer split at two preserves IDs but has no throughput gain. Retain one; see lab-results/m1-decode-sep06.json.' },
+    decodePleGateKSplits: { value: 1, tuningReason: 'September 6 paired M1 testing of the exact integer split at two preserves IDs but is mixed across prompts. Retain one; see lab-results/m1-decode-sep06.json.' },
     decodeLookahead: {
       value: 2,
       tuningReason:
-        'the loop this engine has always run, one step awaited and one behind it. Not measured '
-        + 'deeper on this machine: a token is 23 ms here against a readback hop of about 4, so the '
-        + 'second step already hides the hop (docs/ENGINE-PERF.md section 15). Depth 4 was '
-        + 'measured on the RTX 5070 only, where a token is under 4 ms.',
+        'Retain two steps in flight. September 6 paired M1 testing of depth four preserves '
+        + 'generated IDs but does not improve throughput. Timestamp diagnostics also add '
+        + 'submission and readback overhead; see lab-results/m1-decode-sep06.json.',
     },
     decodeGemvWorkgroupWidth: {
       value: 64,
@@ -898,6 +902,15 @@ export function withLiveLimits(
         `${profile[field].tuningReason} Clamped against the live device, which granted `
         + `${granted}${granted < believed ? ', below the profile' : ', above the profile'}.`,
     } satisfies Tuned<number>;
+  }
+  // Q/K/V batching binds ten storage buffers. A matched adapter family alone is insufficient:
+  // browser/device limits may be lower than the hardware probe on which the profile was based.
+  if (profile.decodeBatchProjections.value && limits.maxStorageBuffersPerShaderStage < 10) {
+    out.decodeBatchProjections = {
+      value: false,
+      tuningReason: `${profile.decodeBatchProjections.tuningReason} Disabled because Q/K/V batching `
+        + `requires 10 storage buffers and the live device granted ${limits.maxStorageBuffersPerShaderStage}.`,
+    } satisfies Tuned<boolean>;
   }
   return out as unknown as ResolvedDeviceProfile;
 }
