@@ -443,7 +443,7 @@ const M1_PROFILE: Gemma4DeviceProfile = {
     },
     attentionScoreLayout: {
       value: 'rows',
-      tuningReason: 'The shipped loop. The dims layout was built for the 5070 and has not been run here.',
+      tuningReason: 'Retain rows. The September 6 M1 dims-layout check changes generated IDs on all three prompts, starting at positions 5, 16 and 27. See lab-results/m1-decode-sep06.json.',
     },
     decodeGemv2KSplits: {
       value: 1,

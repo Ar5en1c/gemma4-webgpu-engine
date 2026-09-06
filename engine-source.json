@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/Ar5en1c/purrview",
-  "revision": "3f57eeb5130f27e2d7354c0fdb85936ea1525674",
+  "revision": "970ef0288b4e828ab763fb3d0b5a959fd9bf7aa7",
   "directory": "src/engine/gemma4",
   "excludes": [
     "dev"
