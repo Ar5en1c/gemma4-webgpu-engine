@@ -11,6 +11,7 @@
 // into logits land next round, and until they do the executor below says so in plain words
 // instead of producing plausible garbage.
 
+import { setBatchWorkgroup } from './kernels/projectionBatch';
 import { repackTile16, tile16Target } from './kernels/repack';
 import type { BufferLike } from './buffers';
 import { Gemma4DecodeStream, Gemma4Tokenizer, type Gemma4Message } from './tokenizer';
@@ -30,6 +31,14 @@ import {
   type Gemma4Arch,
   type ProgressEvent,
 } from './plan';
+import { GEMV_WIDE_COLS } from './kernels/qgemvWide';
+import {
+  createLookupDrafter,
+  emptySpeculationStats,
+  runSpeculativeLoop,
+  type Drafter,
+  type SpeculationStats,
+} from './draft';
 import { BufferManager, type BufferManagerStats } from './buffers';
 import { PipelineStore, chooseReduceVariant, runSubgroupSelfTest, type ReduceVariant } from './pipeline';
 import { GpuExecutor, asDeviceLike, type ExecutorResources, type ForwardExecutor } from './runtime';
@@ -37,11 +46,15 @@ import { bf16StaysPacked, bf16ToF32 } from './quant';
 import { Gemma4DeviceError, requestGemma4Device, type Gemma4Device } from './device';
 import { resolveUrl, type SafetensorsDirectory } from './safetensors';
 import { WeightCache, defaultFetch, loadWeights, loaderConcurrencyFor, uploadDrainBytes, type LoadReceipt } from './cache';
-import { resolveDeviceProfile, withLiveLimits } from './deviceProfile';
+import { setProducerDownSplits } from './kernels/exactSplit';
+import { setPleGateSplits } from './kernels/pleSplit';
+import { applyProfileGeometry, resolveDeviceProfile, withLiveLimits, type ResolvedDeviceProfile } from './deviceProfile';
 import { planGatherSplit } from './tableSplit';
 import { PLE_CODES } from './execute';
 import type { GatherSliceRef } from './plan';
 import { PLE_GROUPS } from './kernels/layerGeometry';
+import { gemvGeometry, kSplitsOf, setGemvGeometry } from './kernels/qgemv';
+import { attentionGeometry, kvSplitsOf, setAttentionGeometry } from './kernels/attention';
 
 // ----------------------------------------------------------------------------- public types
 
@@ -108,6 +121,24 @@ export interface Gemma4GenerateOptions {
   maxNewTokens?: number;
   eosTokenId?: number | number[];
   signal?: AbortSignal;
+  /**
+   * Opt in to speculative decoding. OFF BY DEFAULT, and deliberately so: it is a device switch,
+   * not an engine default. The wide kernel it rides on costs 1.23 weight streams a pass on the M1
+   * and has never been measured on anything else, so on a device whose register file makes that
+   * number worse, or on a prompt the lookup drafter has no purchase on, turning it on is a loss
+   * rather than a win. Nothing about the tokens changes either way (draft.ts header): a run with
+   * this on emits the same ids in the same order as a run with it off, which is what the gate
+   * asserts. Ignored when the executor offers no verify pass.
+   */
+  speculate?: boolean;
+  /** The drafter to use when `speculate` is on. Defaults to prompt lookup, which carries no weights. */
+  drafter?: Drafter;
+  /**
+   * Called once when a speculative run ends, with what the drafter actually earned. This is the
+   * point of the switch: acceptance is a property of the prompt, so it is measured per run rather
+   * than assumed once.
+   */
+  onSpeculation?: (stats: SpeculationStats) => void;
 }
 
 export interface Gemma4Chunk {
@@ -240,6 +271,12 @@ interface LoadedState {
   pleSlices: GatherSliceRef[];
   /** The union of every stop set the checkpoint's files name. See `unionStopTokens`. */
   stopTokenIds: readonly number[];
+  /**
+   * The device profile this adapter resolved to at load, limits merged. Its kernel geometry was
+   * applied before the first pipeline was built (deviceProfile.ts applyProfileGeometry); its
+   * loop shape, `decodeLookahead`, is read by `generate` each turn.
+   */
+  profile: ResolvedDeviceProfile;
   /**
    * What the load actually did on the wire and in the cache: requests by kind, runs resumed
    * against runs fetched, the storage readiness answer, and the signed URL that served it. Kept
@@ -379,6 +416,26 @@ export class Gemma4Mobile {
       gpu.limits,
     );
 
+    // The profile's kernel geometry, applied HERE because it has to happen before any pipeline is
+    // built: the pipeline store caches compiled modules by their text and a registry entry reads
+    // the active geometry at build time. Nothing had ever applied these fields, so a profile could
+    // name a shape the engine did not run; deviceProfile.ts applyProfileGeometry says which four
+    // fields are applied and which two are still only recorded, and why.
+    setBatchWorkgroup(profile.decodeBatch2WorkgroupWidth.value);
+    setProducerDownSplits(profile.decodeProducerDownKSplits.value);
+    setPleGateSplits(profile.decodePleGateKSplits.value);
+    const geometryChanges = applyProfileGeometry(profile, {
+      setAttentionGeometry,
+      setGemvGeometry,
+      gemvGeometry,
+    });
+    // Nothing consumes the returned list here: onProgress's event shape belongs to the loader's
+    // byte counting and there is no report object at this point in the load. What observes this
+    // is the gate, which runs applyProfileGeometry against every shipped profile and asserts it
+    // changes nothing today, and against a hypothetical split profile and asserts it changes
+    // exactly the two things it should. An assertion beats a log line nobody reads.
+    void geometryChanges;
+
     const cache = options.cache === false
       ? null
       : await WeightCache.open(options.cacheName, profile.idbMaxValueBytes.value);
@@ -408,6 +465,7 @@ export class Gemma4Mobile {
       scalars: new Map<string, number>(),
       pleSlices: [],
       stopTokenIds,
+      profile,
       loadReceipt: null,
     });
 
@@ -597,27 +655,56 @@ export class Gemma4Mobile {
 
     const eosIds = eosSet(options.eosTokenId, this.state.stopTokenIds);
     const stream = this.state.tokenizer.decodeStream({ skipSpecialTokens: true });
-    const loop = runGreedyLoop({
-      firstToken,
-      maxNewTokens: options.maxNewTokens ?? DEFAULT_MAX_NEW_TOKENS,
-      eosIds,
-      startPosition: ids.length,
-      isAborted,
-      decode: (prevToken, position) => {
-        // The generated token enters the cached transcript as its KV rows are written, so the
-        // next turn's longest common prefix covers the reply the app echoes back.
-        this.kvState.append([prevToken]);
-        return this.executor.decode(prevToken, position);
-      },
-      // The GPU executor offers the lookahead step; the dry and unprepared executors do not, and
-      // the loop runs serially over `decode` for them. Under the lookahead the transcript append
-      // moves to `onAdvance`, which fires for exactly the tokens whose step was submitted.
-      decodeAhead: this.executor.decodeAhead ? (position) => this.executor.decodeAhead!(position) : undefined,
-      onAdvance: (token) => { this.kvState.append([token]); },
-    });
-    for await (const step of loop) {
-      const delta = stream.push(step.token);
-      yield { token: step.token, delta, text: stream.text };
+    const speculation = emptySpeculationStats();
+
+    // The switch. Speculation needs the caller to ask for it AND the executor to offer a verify
+    // pass; the dry recorder offers neither, so the harness path is untouched by any of this.
+    const verify = options.speculate === true ? this.executor.verify?.bind(this.executor) : undefined;
+    const loop = verify
+      ? runSpeculativeLoop({
+          firstToken,
+          maxNewTokens: options.maxNewTokens ?? DEFAULT_MAX_NEW_TOKENS,
+          eosIds,
+          startPosition: ids.length,
+          history: ids,
+          maxColumns: GEMV_WIDE_COLS,
+          isAborted,
+          drafter: options.drafter ?? createLookupDrafter(),
+          decode: (prevToken, position) => this.executor.decode(prevToken, position),
+          verify,
+          onAdvance: (token) => { this.kvState.append([token]); },
+          stats: speculation,
+        })
+      : runGreedyLoop({
+          firstToken,
+          maxNewTokens: options.maxNewTokens ?? DEFAULT_MAX_NEW_TOKENS,
+          eosIds,
+          startPosition: ids.length,
+          isAborted,
+          decode: (prevToken, position) => {
+            // The generated token enters the cached transcript as its KV rows are written, so the
+            // next turn's longest common prefix covers the reply the app echoes back.
+            this.kvState.append([prevToken]);
+            return this.executor.decode(prevToken, position);
+          },
+          // The GPU executor offers the lookahead step; the dry and unprepared executors do not, and
+          // the loop runs serially over `decode` for them. Under the lookahead the transcript append
+          // moves to `onAdvance`, which fires for exactly the tokens whose step was submitted.
+          decodeAhead: this.executor.decodeAhead ? (position) => this.executor.decodeAhead!(position) : undefined,
+          // How many of those steps stay in flight: the profile's number, 2 on every device but
+          // the one where a deeper queue was measured to pay (deviceProfile.ts decodeLookahead).
+          lookaheadDepth: this.state.profile.decodeLookahead.value,
+          onAdvance: (token) => { this.kvState.append([token]); },
+        });
+    try {
+      for await (const step of loop) {
+        const delta = stream.push(step.token);
+        yield { token: step.token, delta, text: stream.text };
+      }
+    } finally {
+      // Reported even when the caller breaks out of the stream or aborts, because a partial run's
+      // acceptance is exactly as informative as a complete one's.
+      if (verify) options.onSpeculation?.(speculation);
     }
   }
 
@@ -640,6 +727,7 @@ export class Gemma4Mobile {
     const variant = chooseReduceVariant(this.state.gpu.features.subgroups, passed);
     this.pipelines = new PipelineStore(this.state.gpu, variant);
     const executor = new GpuExecutor({
+      batchProjections: this.state.profile.decodeBatchProjections.value,
       gpu: this.state.gpu,
       pipelines: this.pipelines,
       buffers: this.state.buffers!,
@@ -655,7 +743,7 @@ export class Gemma4Mobile {
     // and it checks each kernel's storage binding count against the adapter's limit of 10
     // (ENGINE-PLAN risk 6), which is a check that could only ever run here.
     await executor.prepare(
-      planDecodeStep(this.state.arch, this.state.pleSlices),
+      planDecodeStep(this.state.arch, this.state.pleSlices, { batchProjections: this.state.profile.decodeBatchProjections.value, producerDownKSplits: this.state.profile.decodeProducerDownKSplits.value, pleGateKSplits: this.state.profile.decodePleGateKSplits.value, downKSplits: kSplitsOf(gemvGeometry(2)), attnKvSplits: kvSplitsOf(attentionGeometry()), attnKSplits: kSplitsOf(gemvGeometry(4)) }),
       {
         arch: this.state.arch,
         mode: 'gemv',

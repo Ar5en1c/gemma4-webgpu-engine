@@ -100,21 +100,20 @@ export interface RmsNormVariant {
  * orders every read before every write. Running it in place saves an activation sized buffer,
  * which matters on the M1 where decode is streaming bound.
  */
-export function rmsNormWgsl(variant: RmsNormVariant): string {
-  const W = variant.reduce === 'subgroup' ? WORKGROUP_SIZE : FALLBACK_WORKGROUP_SIZE;
+/**
+ * The reduction this kernel is built on, as text, so a kernel that fuses a norm into something
+ * else (kernels/attnPrologue.ts) reduces through the SAME butterfly, the same slot order and the
+ * same workgroup width and is the norm kernel's arithmetic by construction rather than by
+ * argument. `head` goes first in the module (the enable directive has to), `reduce` sits after
+ * the `acc` loop and defines `total`.
+ */
+export function normReducePieces(reduce: ReducePath): { W: number; head: string; reduce: string } {
+  const W = reduce === 'subgroup' ? WORKGROUP_SIZE : FALLBACK_WORKGROUP_SIZE;
   const SLOTS = slotsOf(W);
-  const gainBinding = variant.weighted
-    ? '@group(0) @binding(1) var<storage, read> gain: array<vec4<f32>>;\n'
-    : '';
-  const dstBinding = variant.weighted ? 2 : 1;
-  const paramsBinding = variant.weighted ? 3 : 2;
-  const apply = variant.weighted ? 'src[base + i] * inv * gain[i]' : 'src[base + i] * inv';
-
-  const head = variant.reduce === 'subgroup'
+  const head = reduce === 'subgroup'
     ? `${SUBGROUP_ENABLE}\n${SUBGROUP_BUTTERFLY_WGSL}\nvar<workgroup> sgPartials: array<f32, ${SLOTS}>;\n`
     : workgroupTreeWgsl('treeScratch', W);
-
-  const reduce = variant.reduce === 'subgroup'
+  const reduceText = reduce === 'subgroup'
     ? `  // The butterfly runs first, in uniform control flow, and only then does one lane per
   // 32 lane group store its slot. Reduce above store, never the other way round.
   let lanes = sgSum32(acc);
@@ -126,6 +125,17 @@ export function rmsNormWgsl(variant: RmsNormVariant): string {
   // mitigation 2: the order is a property of the kernel, not of the schedule.
   let total = ${Array.from({ length: SLOTS }, (_, g) => `sgPartials[${g}]`).join(' + ')};`
     : `  let total = wgSum(acc, lid);`;
+  return { W, head, reduce: reduceText };
+}
+
+export function rmsNormWgsl(variant: RmsNormVariant): string {
+  const { W, head, reduce } = normReducePieces(variant.reduce);
+  const gainBinding = variant.weighted
+    ? '@group(0) @binding(1) var<storage, read> gain: array<vec4<f32>>;\n'
+    : '';
+  const dstBinding = variant.weighted ? 2 : 1;
+  const paramsBinding = variant.weighted ? 3 : 2;
+  const apply = variant.weighted ? 'src[base + i] * inv * gain[i]' : 'src[base + i] * inv';
 
   return /* wgsl */ `${head}
 struct NormParams {

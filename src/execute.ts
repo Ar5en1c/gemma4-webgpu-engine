@@ -31,7 +31,11 @@
 // produces plausible numbers rather than an error.
 
 import {
+  ROLE_ATTN_MERGE,
+  ROLE_DOWN_MERGE,
   ROLE_GELU_DOWN,
+  ROLE_KV_PROLOGUE,
+  ROLE_Q_PROLOGUE,
   ROLE_GELU_PLE,
   ROLE_JOIN_FINAL,
   ROLE_JOIN_MLP,
@@ -41,6 +45,7 @@ import {
   PER_LAYER_INPUT_SCALE,
   headDimForLayer,
   isGlobalLayer,
+  gemvBitsForSite,
   mlpIntermediateForLayer,
   perLayerProjectionScale,
   type DispatchStep,
@@ -50,6 +55,8 @@ import { kvRoleForLayer, type KvLayout } from './kv';
 import { FINAL_LOGIT_SOFTCAP } from './kernels/logitSoftcap';
 import { ARGMAX_ELEMS_PER_WORKGROUP } from './kernels/argmax';
 import { GEMV_WIDE_COLS } from './kernels/qgemvWide';
+import { gemvGeometry, kSplitsOf, GEMV_MAX_K_SPLITS as MAX_GEMV_K_SPLITS } from './kernels/qgemv';
+import { attentionGeometry, kvSplitsOf, ATTENTION_MAX_KV_SPLITS as MAX_ATTN_KV_SPLITS } from './kernels/attention';
 import { PLE_GATHER_SLICED_NAME } from './kernels/embedGather';
 import { sliceName } from './buffers';
 
@@ -123,6 +130,8 @@ export interface ResolvedStep {
 // ------------------------------------------------------------------------ forward geometry
 
 export interface ForwardGeometry {
+  /** Single-token PLE reads its contiguous layer row in place instead of copying it. */
+  readonly directPle?: boolean;
   readonly arch: Gemma4Arch;
   /** 'gemv' for a decode step, 'gemm' for a prefill chunk. Matches the step plan's mode. */
   readonly mode: 'gemv' | 'gemm';
@@ -241,16 +250,31 @@ export function slotElements(arch: Gemma4Arch, maxTokens: number): Record<string
   const argmaxPairs = Math.ceil(arch.vocabSize / ARGMAX_ELEMS_PER_WORKGROUP) * 2;
   return {
     normed: t * arch.hiddenSize,
-    q: t * q,
+    // q, k and v hold a split projection's partials on a decode step (kernels/attnPrologue.ts
+    // fold variants), so they are sized at the largest split the geometry allows; a plain step
+    // and a prefill chunk use the front of each.
+    q: t * q * MAX_GEMV_K_SPLITS,
     qn: t * q,
     qr: t * q,
-    k: t * wideHead,
+    k: t * wideHead * MAX_GEMV_K_SPLITS,
     kn: t * wideHead,
     kr: t * wideHead,
-    v: t * wideHead,
+    v: t * wideHead * MAX_GEMV_K_SPLITS,
     vn: t * wideHead,
     attn: t * q,
     proj: t * arch.hiddenSize,
+    // The split K down_proj's partials: one row scaled value per split. Sized at the largest
+    // split the geometry allows, so the slot does not change size with a device profile and a
+    // plan taken on one machine can be replayed on another. At hiddenSize 1536 and 8 splits this
+    // is 48 KiB a token, which is under a thousandth of the residual traffic it saves nothing of
+    // and is why it is not conditional.
+    'proj.part': t * arch.hiddenSize * MAX_GEMV_K_SPLITS,
+    'ple.gate.part': t * arch.pleDim * MAX_GEMV_K_SPLITS,
+    // The split attention's unnormalised partials: per (position, head, split) a headDim vector
+    // plus one lane carrying that partial's running max and weight sum, which is what makes the
+    // fold able to re-weight rather than having to trust a partial that normalised itself. Sized
+    // at the widest head and the largest split, 132 KiB a token, for the same reason as above.
+    'attn.part': t * arch.queryHeads * MAX_ATTN_KV_SPLITS * (wideHead + 4),
     gate: t * inter,
     up: t * inter,
     act: t * inter,
@@ -356,7 +380,23 @@ function gemvWide(geometry: ForwardGeometry, kernel: string): string {
   if (geometry.tokens > GEMV_WIDE_COLS) {
     throw new Error(`gemma4 engine: a verify pass carries at most ${GEMV_WIDE_COLS} positions, got ${geometry.tokens}`);
   }
+  // The split down_proj included: qgemv-2bit-gelu-split resolves onto qgemv-2bit-gelu-split-m2,
+  // whose partials the plan's fold sums over every column (ROLE_DOWN_MERGE below).
   return `${kernel}-m${GEMV_WIDE_COLS}`;
+}
+
+/**
+ * The 4-bit attention split and its fold on a verify pass: the wide family has no 4-bit split, so
+ * on a pass over more than one position the split projection runs its plain wide build and the
+ * fold prologue runs its plain build, both the same names the unsplit plan carries. Decided in
+ * one place, from the same geometry, so the projection and its fold cannot disagree.
+ */
+function attnUnsplitOnWide(geometry: ForwardGeometry, kernel: string): string {
+  if (geometry.mode !== 'gemv' || geometry.tokens === 1) return kernel;
+  if (kernel === 'qgemv-4bit-split') return 'qgemv-4bit';
+  if (kernel === 'q-norm-rope-fold') return 'q-norm-rope';
+  if (kernel === 'kv-norm-rope-store-fold') return 'kv-norm-rope-store';
+  return kernel;
 }
 
 function matmulKernel(geometry: ForwardGeometry, stepKernel: string): string {
@@ -503,13 +543,36 @@ export function resolveStep(step: DispatchStep, geometry: ForwardGeometry): Reso
         gain: weight(base(ROLE_NORM_GAIN[step.role]!)),
       }, s('normed'), { rows: tokens, width: hidden, eps: arch.rmsEps });
 
+    case 'q_proj, k_proj, v_proj':
+    case 'gate_proj, up_proj': {
+      if (tokens !== 1) throw new Error('batched projections require a single token');
+      const qkv = step.role === 'q_proj, k_proj, v_proj';
+      const modules = qkv ? ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj'] : ['mlp.gate_proj', 'mlp.up_proj'];
+      const outputs = qkv ? ['q', 'k', 'v'] : ['gate', 'up'];
+      const inputs: Record<string, BufferRef> = { x: s('normed') };
+      const params: Record<string, number> = { k: hidden };
+      modules.forEach((module, i) => {
+        inputs[`w${i}`] = weight(base(`${module}.weight`));
+        inputs[`s${i}`] = weight(base(`${module}.weight_scale`));
+        if (i < modules.length - 1) inputs[`out${i}`] = s(outputs[i]!);
+        const rows = qkv ? (i === 0 ? heads * headDim : headDim) : inter;
+        const linear = linearParams(geometry, base(module), hidden, rows);
+        params[`rows${i}`] = rows;
+        params[`inScale${i}`] = linear.inScale!;
+        params[`outScale${i}`] = linear.outScale!;
+      });
+      return make(step.kernel, inputs, s(outputs[outputs.length - 1]!), params);
+    }
+
     case 'q_proj':
     case 'k_proj':
     case 'v_proj': {
       const module = ROLE_MODULE[step.role]!;
       const rows = step.role === 'q_proj' ? heads * headDim : headDim;
       const out = step.role === 'q_proj' ? 'q' : step.role === 'k_proj' ? 'k' : 'v';
-      return make(matmulKernel(geometry, step.kernel), {
+      // A verify pass runs the wide family, which has no 4-bit split: the split name drops to
+      // the plain one there and the fold prologue below drops to the plain one beside it.
+      return make(matmulKernel(geometry, attnUnsplitOnWide(geometry, step.kernel)), {
         wq: weight(base(`${module}.weight`)),
         scales: weight(base(`${module}.weight_scale`)),
         x: s('normed'),
@@ -535,6 +598,42 @@ export function resolveStep(step: DispatchStep, geometry: ForwardGeometry): Reso
         rows: tokens, width: headDim, eps: arch.rmsEps,
       });
 
+    // The fused prologue of a decode step (kernels/attnPrologue.ts): the gains are the same
+    // tensors the separate norms read, the tables the same slots the separate ropes read, and
+    // the outputs the same qr slot and the same cache rows.
+    // The fold variants (a split q, k, v) take the projections' output scales, the snap the
+    // split builds left to them; the plain variants ignore the two extra params.
+    case ROLE_Q_PROLOGUE:
+      return make(attnUnsplitOnWide(geometry, step.kernel), {
+        src: s('q'),
+        gain: weight(base('self_attn.q_norm.weight')),
+        cosTab: s(`rope.cos.${ropeKind}`),
+        sinTab: s(`rope.sin.${ropeKind}`),
+      }, s('qr'), {
+        rows: tokens * heads,
+        width: headDim,
+        eps: arch.rmsEps,
+        headsPerPosition: heads,
+        outScale: geometry.scalar(base('self_attn.q_proj.output_activation_scale')),
+      });
+
+    case ROLE_KV_PROLOGUE:
+      return make(attnUnsplitOnWide(geometry, step.kernel), {
+        k: s('k'),
+        v: s('v'),
+        gain: weight(base('self_attn.k_norm.weight')),
+        cosTab: s(`rope.cos.${ropeKind}`),
+        sinTab: s(`rope.sin.${ropeKind}`),
+      }, { kind: 'kv', name: String(layer), elements: 0 }, {
+        headDim,
+        tokenCount: tokens,
+        eps: arch.rmsEps,
+        startPos: geometry.startPosition,
+        maxContext: geometry.maxContext,
+        kOutScale: geometry.scalar(base('self_attn.k_proj.output_activation_scale')),
+        vOutScale: geometry.scalar(base('self_attn.v_proj.output_activation_scale')),
+      });
+
     case 'rope q':
       return make('rope', {
         src: s('qn'), cosTab: s(`rope.cos.${ropeKind}`), sinTab: s(`rope.sin.${ropeKind}`),
@@ -558,10 +657,16 @@ export function resolveStep(step: DispatchStep, geometry: ForwardGeometry): Reso
     case 'attention': {
       const role = kvRoleForLayer(layer);
       const cacheLayer = role.kind === 'producer' ? role.layer : role.readsFrom;
+      // The split rides on the kernel's IDENTITY, and the plan emits the split name only where it
+      // also emits the fold. Reading the live geometry here instead, as this did, split prefill
+      // too: prefill shares bindAttention, so it dispatched z = kvSplits and, because this branch
+      // routed to attn.part only on a decode step, wrote unfolded partials into the plain attn
+      // slot. The prompt was attended wrongly and generation was garbage from the first token.
+      const kvSplits = step.kernel === 'attention-decode-split' ? kvSplitsOf(attentionGeometry()) : 1;
       return make(step.kernel, {
         q: s('qr'),
         cache: { kind: 'kv', name: String(cacheLayer), elements: 0 },
-      }, s('attn'), {
+      }, kvSplits > 1 ? s('attn.part') : s('attn'), {
         headDim,
         heads,
         qCount: tokens,
@@ -569,6 +674,27 @@ export function resolveStep(step: DispatchStep, geometry: ForwardGeometry): Reso
         kvLen: kvLengthAfter(geometry),
         window: isGlobalLayer(arch, layer) ? 0 : arch.slidingWindow,
         maxContext: geometry.maxContext,
+      });
+    }
+
+    case ROLE_ATTN_MERGE: {
+      const kvSplits = step.kSplits ?? 1;
+      if (kvSplits < 2) {
+        throw new Error(`gemma4 engine: a ${ROLE_ATTN_MERGE} step must carry kSplits above 1, got ${kvSplits}`);
+      }
+      const live = kvSplitsOf(attentionGeometry());
+      if (live !== kvSplits) {
+        throw new Error(
+          `gemma4 engine: this ${ROLE_ATTN_MERGE} step was planned at kvSplits ${kvSplits} and the `
+          + `active attention geometry is ${live}. The plan and the compiled module disagree, `
+          + 'which means the geometry moved after the plan was built. Rebuild the plan.',
+        );
+      }
+      return make('attention-decode-merge', { part: s('attn.part') }, s('attn'), {
+        headDim,
+        heads,
+        qCount: tokens,
+        kvSplits,
       });
     }
 
@@ -635,15 +761,60 @@ export function resolveStep(step: DispatchStep, geometry: ForwardGeometry): Reso
         srqScale: geometry.scalar(base('mlp.down_proj.input_activation_scale')),
       });
 
-    case ROLE_GELU_DOWN:
+    case 'producer down exact partials':
+      if (tokens !== 1) throw new Error('producer split needs one token');
+      return make(step.kernel, {
+        wq: weight(base('mlp.down_proj.weight')), scales: weight(base('mlp.down_proj.weight_scale')),
+        gate: s('gate'), up: s('up'),
+      }, s('proj.part'), linearParams(geometry, base('mlp.down_proj'), inter, hidden));
+    case 'producer down exact fold':
+      return make(step.kernel, { part: s('proj.part'), scales: weight(base('mlp.down_proj.weight_scale')) }, s('proj'), {
+        ...linearParams(geometry, base('mlp.down_proj'), inter, hidden), kSplits: step.kSplits!,
+      });
+
+    case ROLE_GELU_DOWN: {
       // The fused K10 prologue (decode only): the GEMV reads gelu(gate) * up itself, snapped by its
       // own input scale, which is the scale the separate pass carried.
+      //
+      // On a split geometry it writes hidden * kSplits partials into the scratch slot instead of
+      // the projection, and the fold step the plan put after it sums them. Which of the two runs
+      // is settled by the kernel the plan named, not by the geometry singleton: the split build is
+      // its own registry entry and the plan emits it only alongside ROLE_DOWN_MERGE.
+      //
+      // On a verify pass the wide split form runs (qgemvWide.ts qgemv2GeluSplitWideKernel) and
+      // writes its partials column major, so the fold below runs over tokens * hidden rows.
+      const kSplits = step.kernel === 'qgemv-2bit-gelu-split' ? kSplitsOf(gemvGeometry(2)) : 1;
       return make(gemvWide(geometry, step.kernel), {
         wq: weight(base('mlp.down_proj.weight')),
         scales: weight(base('mlp.down_proj.weight_scale')),
         gate: s('gate'),
         up: s('up'),
-      }, s('proj'), linearParams(geometry, base('mlp.down_proj'), inter, hidden));
+      }, kSplits > 1 ? s('proj.part') : s('proj'),
+      linearParams(geometry, base('mlp.down_proj'), inter, hidden));
+    }
+
+    case ROLE_DOWN_MERGE: {
+      const kSplits = step.kSplits ?? 1;
+      if (kSplits < 2) {
+        throw new Error(`gemma4 engine: a ${ROLE_DOWN_MERGE} step must carry kSplits above 1, got ${kSplits}`);
+      }
+      const live = kSplitsOf(gemvGeometry(2));
+      if (live !== kSplits) {
+        throw new Error(
+          `gemma4 engine: this ${ROLE_DOWN_MERGE} step was planned at kSplits ${kSplits} and the `
+          + `active 2-bit geometry is ${live}. The plan and the compiled module disagree, which `
+          + 'means the geometry moved after the plan was built. Rebuild the plan.',
+        );
+      }
+      return make('qgemv-merge', { part: s('proj.part') }, s('proj'), {
+        ...linearParams(geometry, base('mlp.down_proj'), inter, hidden),
+        // One fold row per (column, row): the wide split kernel lays its partials out column
+        // major then row then split, which is the wide family's own output order, so a verify
+        // pass folds tokens * hidden rows and a one token step folds hidden.
+        numRows: hidden * tokens,
+        kSplits,
+      });
+    }
 
     case 'down_proj':
       return make(matmulKernel(geometry, step.kernel), {
@@ -668,7 +839,7 @@ export function resolveStep(step: DispatchStep, geometry: ForwardGeometry): Reso
         wq: weight(base(`${module}.weight`)),
         scales: weight(base(`${module}.weight_scale`)),
         x: residual(false),
-      }, s('ple.gate'), linearParams(geometry, base(module), hidden, arch.pleDim));
+      }, step.kernel === 'ple-gate-split' ? s('ple.gate.part') : s('ple.gate'), linearParams(geometry, base(module), hidden, arch.pleDim));
     }
 
     case 'per_layer_projection': {
@@ -686,6 +857,23 @@ export function resolveStep(step: DispatchStep, geometry: ForwardGeometry): Reso
       // The same gather as the unfused step below, then the I8 GEMV over gelu(gate) * row.
       const module = ROLE_MODULE['per_layer_projection']!;
       const dim = arch.pleDim;
+      if (step.kernel === 'ple-fold-projection') {
+        if (tokens !== 1) throw new Error('PLE split needs one token');
+        const gateParams = linearParams(geometry, base('per_layer_input_gate'), hidden, dim);
+        return make(step.kernel, {
+          wq: weight(base(`${module}.weight`)), scales: weight(base(`${module}.weight_scale`)),
+          gate: s('ple.gate.part'), up: s('ple.input'), gateScales: weight(base('per_layer_input_gate.weight_scale')),
+        }, s('proj'), { ...linearParams(geometry, base(module), dim, hidden), upOffset: layer * dim / 4,
+          gateInScale: gateParams.inScale!, gateOutScale: gateParams.outScale! });
+      }
+      if (tokens === 1 && geometry.directPle) {
+        return make(step.kernel, {
+          wq: weight(base(`${module}.weight`)),
+          scales: weight(base(`${module}.weight_scale`)),
+          gate: s('ple.gate'),
+          up: s('ple.input'),
+        }, s('proj'), { ...linearParams(geometry, base(module), dim, hidden), upOffset: layer * dim / 4 });
+      }
       const copies: SliceCopy[] = [];
       for (let t = 0; t < tokens; t += 1) {
         copies.push({

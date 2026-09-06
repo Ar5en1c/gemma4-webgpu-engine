@@ -267,6 +267,16 @@ export interface DispatchStep {
   /** MLP intermediate width, on the MLP matmul and activation steps: 6144 producer, 12288 consumer. */
   readonly intermediate?: number;
   /**
+   * On a split K step and its fold only: how many ways the K reduction was cut across workgroups.
+   *
+   * It travels ON THE STEP for the same reason headDim and window do. A recorded sequence has to
+   * carry what the dispatch actually needs, or a reader of it has to know which module level
+   * geometry singleton was live when it was taken, which is exactly the kind of thing that is
+   * remembered wrongly. Absent means one, which is every step of every plan on a device whose
+   * profile does not ask for a split.
+   */
+  readonly kSplits?: number;
+  /**
    * On the per layer embedding gather only, and only on an adapter whose buffers are too small to
    * hold the PLE table whole: which vocabulary range of the split table this dispatch serves.
    *
@@ -398,8 +408,35 @@ export const ROLE_JOIN_FINAL = 'post_per_layer_input_norm plus residual, layer_s
  * prefill chunk keeps gelu-mul and the GEMM.
  */
 export const ROLE_GELU_DOWN = 'gelu times up, down_proj';
+/**
+ * The fold of a split K down_proj, present only when a device profile asks for `kSplits` on the
+ * 2-bit family. It is a PLANNED step and not a hidden second dispatch inside the GEMV, so the
+ * dispatch census counts it, the timing arm attributes it, and a reader of a recorded sequence
+ * sees the cost rather than having to know about it.
+ */
+export const ROLE_DOWN_MERGE = 'down_proj split fold';
+/**
+ * The fold of a split attention decode, present only when a device profile asks for `kvSplits`.
+ * Planned rather than hidden inside the attention dispatch for the same reason the down_proj fold
+ * is: a recorded sequence has to show what it costs.
+ */
+export const ROLE_ATTN_MERGE = 'attention split fold';
+/**
+ * The fused attention prologue of a decode step (kernels/attnPrologue.ts): q_norm and rope q in
+ * one dispatch on every layer, and on a producer layer k_norm, v_norm, rope k and the KV store in
+ * one more. Prefill keeps the six separate kernels. The role names carry the roles they fused so a
+ * reader of a dispatch list still sees what runs.
+ */
+export const ROLE_Q_PROLOGUE = 'q_norm per head, rope q';
+export const ROLE_KV_PROLOGUE = 'k_norm per head, v_norm weightless, rope k, kv store';
 export const ROLE_GELU_PLE = 'gate times per layer row, per_layer_projection';
 const GEMV_GELU: Record<2 | 4 | 8, string> = { 2: 'qgemv-2bit-gelu', 4: 'qgemv-4bit-gelu', 8: 'qgemv-8bit-gelu' };
+// Spelled here rather than imported because this module deliberately has no imports. The split
+// builds are separate kernels so that a split dispatch cannot be planned without its fold: the
+// name and the merge are chosen together, three lines apart, instead of the split being read off a
+// geometry singleton by every site that shares the unsplit name.
+const GEMV_GELU_SPLIT_2BIT = 'qgemv-2bit-gelu-split';
+const ATTENTION_DECODE_SPLIT = 'attention-decode-split';
 
 /**
  * A layer's input norm as a step of its own. Layer 0 runs it (nothing precedes layer 0 but the
@@ -414,7 +451,45 @@ export function inputNormStep(layer: number): DispatchStep {
 /** The head's final norm as a step, for the prefill head and for a dev page that seeds the residual. */
 export const FINAL_NORM_STEP: DispatchStep = Object.freeze({ kernel: 'rms-norm', phase: 'head', layer: -1, role: 'final norm' });
 
-export function planLayer(arch: Gemma4Arch, layer: number, mode: 'gemv' | 'gemm'): DispatchStep[] {
+export interface PlanOptions {
+  /** False keeps the separate attention norms, rotation and KV store for a control run. */
+  readonly attentionPrologue?: boolean;
+  readonly batchProjections?: boolean;
+  readonly producerDownKSplits?: number;
+  readonly pleGateKSplits?: number;
+  /**
+   * How many ways to cut the 2-bit down_proj's K reduction across workgroups, from the active
+   * GEMV geometry. 1, the default, is the plan this engine has always built.
+   *
+   * It is a PARAMETER and not a read of kernels/qgemv.ts because this file deliberately has no
+   * imports, so that the check runner can transpile it alone. The caller that knows the device
+   * profile passes it; everything else gets the unsplit plan without having to say so.
+   */
+  readonly downKSplits?: number;
+  /**
+   * How many ways to cut the attention decode's KV span across workgroups, from the active
+   * attention geometry. 1, the default, is the plan this engine has always built.
+   *
+   * Decode only. A prefill chunk runs `attention-prefill`, which has no split, so this is ignored
+   * for the gemm mode rather than half applied to it.
+   */
+  readonly attnKvSplits?: number;
+  /**
+   * How many ways to cut the 4-bit q, k and v projections' K reduction across workgroups on a
+   * decode step, from the active 4-bit GEMV geometry. 1, the default, is the plan this engine
+   * has always built. Above 1 the projections run their split build and the fused prologue
+   * runs its fold variant, which sums the partials where it would have read the values; the
+   * split therefore needs the fused prologue and is ignored without it.
+   */
+  readonly attnKSplits?: number;
+}
+
+export function planLayer(
+  arch: Gemma4Arch,
+  layer: number,
+  mode: 'gemv' | 'gemm',
+  options: PlanOptions = {},
+): DispatchStep[] {
   const producer = isKvProducer(arch, layer);
   const attnBits = gemvBitsForSite(arch, layer, 'attn');
   const mlpBits = gemvBitsForSite(arch, layer, 'mlp');
@@ -424,7 +499,7 @@ export function planLayer(arch: Gemma4Arch, layer: number, mode: 'gemv' | 'gemm'
     kernel: string,
     phase: DispatchStep['phase'],
     role: string,
-    extra?: { headDim?: number; window?: number; intermediate?: number },
+    extra?: { headDim?: number; window?: number; intermediate?: number; kSplits?: number },
   ): void => {
     steps.push({ kernel, phase, layer, role, ...extra });
   };
@@ -444,28 +519,55 @@ export function planLayer(arch: Gemma4Arch, layer: number, mode: 'gemv' | 'gemm'
   // kernels and is restated here only so nobody reads this plan and adds the standard one.
   // Layer 0's input norm; every later layer's arrived with the previous layer's tail join.
   if (layer === 0) steps.push(inputNormStep(layer));
-  push(mm[attnBits], 'attn', 'q_proj', geo);
-  if (producer) {
-    push(mm[attnBits], 'attn', 'k_proj', geo);
-    push(mm[attnBits], 'attn', 'v_proj', geo);
+  const fusedPrologue = mode === 'gemv' && options.attentionPrologue !== false;
+  // The split projections and their fold are named together or not at all: a split dispatch
+  // whose partials nothing folds is unrepresentable here, as with the down_proj split.
+  const attnSplit = fusedPrologue && attnBits === 4 && (options.attnKSplits ?? 1) > 1;
+  const proj = attnSplit ? 'qgemv-4bit-split' : mm[attnBits];
+  if (mode === 'gemv' && options.batchProjections && producer && !attnSplit) {
+    push('qkv-batch-4bit', 'attn', 'q_proj, k_proj, v_proj', geo);
+  } else {
+    push(proj, 'attn', 'q_proj', geo);
+    if (producer) {
+      push(proj, 'attn', 'k_proj', geo);
+      push(proj, 'attn', 'v_proj', geo);
+    }
   }
-  push('rms-norm', 'attn', 'q_norm per head', geo);
-  if (producer) {
-    push('rms-norm', 'attn', 'k_norm per head', geo);
-    // The weightless per KV head V norm before the cache store, ENGINE-PLAN risk 1 quirk 1,
-    // independently observed by the lab's own census (DECODE-CAMPAIGN.md 4.7).
-    push('rms-norm-weightless', 'attn', 'v_norm weightless', geo);
-  }
-  push('rope', 'attn', 'rope q', geo);
-  if (producer) {
-    push('rope', 'attn', 'rope k', geo);
-    // K9: written into the slot directly, one dispatch for both regions, our own layout
-    // (kv.ts), instead of the incumbent's stage and copy pattern.
-    push('kv-cache-store', 'attn', 'kv store', geo);
+  if (fusedPrologue) {
+    // A decode step runs the fused prologue (kernels/attnPrologue.ts): the same six kernels'
+    // arithmetic in one dispatch a layer plus one a producer layer. On the RTX 5070 the six were
+    // two to four microseconds each of launch and latency over almost no bytes, 172 dispatches a
+    // token (lab-results/5070-dispatch-headroom-sep05.json).
+    push(attnSplit ? 'q-norm-rope-fold' : 'q-norm-rope', 'attn', ROLE_Q_PROLOGUE, geo);
+    if (producer) push(attnSplit ? 'kv-norm-rope-store-fold' : 'kv-norm-rope-store', 'attn', ROLE_KV_PROLOGUE, geo);
+  } else {
+    push('rms-norm', 'attn', 'q_norm per head', geo);
+    if (producer) {
+      push('rms-norm', 'attn', 'k_norm per head', geo);
+      // The weightless per KV head V norm before the cache store, ENGINE-PLAN risk 1 quirk 1,
+      // independently observed by the lab's own census (DECODE-CAMPAIGN.md 4.7).
+      push('rms-norm-weightless', 'attn', 'v_norm weightless', geo);
+    }
+    push('rope', 'attn', 'rope q', geo);
+    if (producer) {
+      push('rope', 'attn', 'rope k', geo);
+      // K9: written into the slot directly, one dispatch for both regions, our own layout
+      // (kv.ts), instead of the incumbent's stage and copy pattern.
+      push('kv-cache-store', 'attn', 'kv store', geo);
+    }
   }
   // K8 is one dispatch per layer with the partials and merge inside it, per the attention
   // lane's kernel, and the prefill shape is its own entry (ENGINE-PLAN 5.4).
-  push(mode === 'gemv' ? 'attention-decode' : 'attention-prefill', 'attn', 'attention', geo);
+  // The fold, on a decode step whose profile asked for a split. Unsplit, and on every prefill
+  // chunk, this is absent and the plan is the one this engine has always built. Prefill never
+  // splits: it takes the unsplit name here, so no profile can reach it.
+  const attnKvSplits = mode === 'gemv' ? (options.attnKvSplits ?? 1) : 1;
+  const attnKernel = mode !== 'gemv' ? 'attention-prefill'
+    : attnKvSplits > 1 ? ATTENTION_DECODE_SPLIT : 'attention-decode';
+  push(attnKernel, 'attn', 'attention', geo);
+  if (attnKvSplits > 1) {
+    push('attention-decode-merge', 'attn', ROLE_ATTN_MERGE, { ...geo, kSplits: attnKvSplits });
+  }
   push(mm[attnBits], 'attn', 'o_proj', geo);
   // K11 shape: the epilogue norms the block output and then adds the residual, fused because
   // re-reading the activation vector is bandwidth (ENGINE-PLAN section 5).
@@ -476,10 +578,35 @@ export function planLayer(arch: Gemma4Arch, layer: number, mode: 'gemv' | 'gemm'
   // MLP, gelu_pytorch_tanh, intermediate 6144 or 12288 by layer kind. Gate and up are separate
   // GEMVs this round; the K10 single pass fusion is a performance round move behind the
   // identity gates, not a correctness round one.
-  push(mm[mlpBits], 'mlp', 'gate_proj', width);
-  push(mm[mlpBits], 'mlp', 'up_proj', width);
+  if (mode === 'gemv' && options.batchProjections) {
+    push(`gate-up-batch-${mlpBits}bit`,  'mlp', 'gate_proj, up_proj', width);
+  } else {
+    push(mm[mlpBits], 'mlp', 'gate_proj', width);
+    push(mm[mlpBits], 'mlp', 'up_proj', width);
+  }
   if (mode === 'gemv') {
-    push(GEMV_GELU[mlpBits], 'mlp', ROLE_GELU_DOWN, width);
+    // On a verify pass too: the executor resolves the split name onto the wide family's own split
+    // build, qgemv-2bit-gelu-split-m2 (execute.ts gemvWide), so one plan serves a token and a
+    // pass. There was briefly a PlanOptions.wide that dropped the split on a pass because the
+    // wide family had none; it cost 1.19 ms a pass on the 5070 at the 96 workgroup shape
+    // (lab-results/5070-wide-pass-breakdown-sep05.json) and the wide split kernel replaced it.
+    const downSplit = mlpBits === 2 && (options.downKSplits ?? 1) > 1;
+    const producerSplit = mlpBits === 4 && (options.producerDownKSplits ?? 1) > 1;
+    if (producerSplit) {
+      push('qgemv-4bit-gelu-exact-split', 'mlp', 'producer down exact partials', width);
+      push('qgemv-exact-merge', 'mlp', 'producer down exact fold', { ...width, kSplits: options.producerDownKSplits });
+    } else {
+      push(downSplit ? GEMV_GELU_SPLIT_2BIT : GEMV_GELU[mlpBits], 'mlp', ROLE_GELU_DOWN, width);
+    }
+    // The consumer half of the model runs down_proj on the 2-bit tile at 1536 rows by K 12288,
+    // which is 96 workgroups; on a part with 48 SMs that shape costs 3.9x what its transposed
+    // sibling costs on identical bytes. A profile that asks for kSplits pays one fold dispatch a
+    // layer to get that back. The 4-bit producer layers are untouched: the split is implemented
+    // on the tile loop only, and kSplitsOf returns 1 for every other family.
+    const downKSplits = options.downKSplits ?? 1;
+    if (downSplit) {
+      push('qgemv-merge', 'mlp', ROLE_DOWN_MERGE, { ...width, kSplits: downKSplits });
+    }
   } else {
     push('gelu-mul', 'mlp', 'gelu times up', width);
     push(mm[mlpBits], 'mlp', 'down_proj', width);
@@ -503,9 +630,10 @@ export function planLayer(arch: Gemma4Arch, layer: number, mode: 'gemv' | 'gemm'
   // width goes through the same `mm` table as the other two sites, so the routing is one rule
   // rather than a constant sitting next to a function that disagrees with it.
   const pleBits = gemvBitsForSite(arch, layer, 'ple');
-  push(mm[pleBits], 'ple', 'per_layer_input_gate');
+  const pleSplit = mode === 'gemv' && (options.pleGateKSplits ?? 1) > 1;
+  push(pleSplit ? 'ple-gate-split' : mm[pleBits], 'ple', 'per_layer_input_gate');
   if (mode === 'gemv') {
-    push(GEMV_GELU[pleBits], 'ple', ROLE_GELU_PLE);
+    push(pleSplit ? 'ple-fold-projection' : GEMV_GELU[pleBits], 'ple', ROLE_GELU_PLE);
   } else {
     push('gelu-mul', 'ple', 'gate times per layer row');
     push(mm[pleBits], 'ple', 'per_layer_projection');
@@ -642,10 +770,14 @@ export function planHead(arch: Gemma4Arch, mode: 'gemv' | 'gemm' = 'gemm'): Disp
 }
 
 /** Every dispatch of one steady state decode token, in order. */
-export function planDecodeStep(arch: Gemma4Arch, pleSlices?: readonly GatherSliceRef[]): DispatchStep[] {
+export function planDecodeStep(
+  arch: Gemma4Arch,
+  pleSlices?: readonly GatherSliceRef[],
+  options: PlanOptions = {},
+): DispatchStep[] {
   const steps: DispatchStep[] = [...planEmbed(arch, pleSlices)];
   for (let layer = 0; layer < arch.layerCount; layer += 1) {
-    steps.push(...planLayer(arch, layer, 'gemv'));
+    steps.push(...planLayer(arch, layer, 'gemv', options));
   }
   steps.push(...planHead(arch, 'gemv'));
   return steps;
@@ -778,6 +910,8 @@ export async function* runGreedyLoop(options: {
   isAborted: () => boolean;
   decode: (prevToken: number, position: number) => Promise<number>;
   decodeAhead?: (position: number) => Promise<number>;
+  /** Maximum GPU-dependent steps in flight. The established path uses two. */
+  lookaheadDepth?: number;
   onAdvance?: (token: number, position: number) => void;
 }): AsyncGenerator<{ token: number; index: number }, void, void> {
   const budget = Math.max(0, Math.floor(options.maxNewTokens));
@@ -805,6 +939,39 @@ export async function* runGreedyLoop(options: {
   const ahead = options.decodeAhead;
   let position = options.startPosition;
   if (budget < 2 || options.isAborted()) return;
+  const depth = options.lookaheadDepth ?? 2;
+  if (!Number.isInteger(depth) || depth < 1 || depth > 8) throw new Error('lookaheadDepth must be an integer in 1..8');
+  if (depth !== 2) {
+    // Queued steps consume the preceding GPU token slot, so no token is guessed. A deeper
+    // queue can cover a readback latency longer than one decode step. Commit only observed
+    // tokens to the transcript and drain every unused step on EOS, abort, error or return().
+    type Answer = { token: number; error?: never } | { token?: never; error: unknown };
+    const queue: Promise<Answer>[] = [];
+    let submitted = 0;
+    const submit = (): void => {
+      const p = options.startPosition + submitted++;
+      queue.push(Promise.resolve().then(() => ahead(p)).then(
+        token => ({ token }), error => ({ error }),
+      ));
+    };
+    options.onAdvance?.(options.firstToken, position);
+    try {
+      while (queue.length < depth && submitted < budget - 1 && !options.isAborted()) submit();
+      for (let index = 1; queue.length > 0; index++) {
+        const answer = await queue.shift()!;
+        if ('error' in answer) throw answer.error;
+        const token = answer.token;
+        if (options.isAborted() || options.eosIds.has(token)) return;
+        if (submitted < budget - 1) submit();
+        if (queue.length > 0) options.onAdvance?.(token, options.startPosition + index);
+        yield { token, index };
+        if (options.isAborted()) return;
+      }
+    } finally {
+      await Promise.all(queue);
+    }
+    return;
+  }
   options.onAdvance?.(options.firstToken, position);
   let pending = ahead(position);
   for (let index = 1; index < budget; index += 1) {

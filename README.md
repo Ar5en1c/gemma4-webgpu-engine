@@ -50,7 +50,24 @@ ship a version of it. As far as we can tell this is the first **browser** engine
   the plan they always ran.
 - About **2 GB** of download on first run, cached afterwards, and roughly 3 GB of free memory.
 
+## Current engine snapshot
+
+The engine is synced from Purrview revision `73fb4d2`. Exact source provenance is recorded in
+[engine-source.json](engine-source.json) and included in copied benchmark results. This update
+includes the latest projection batching, exact integer splits, and device profile tuning.
+Blackwell-specific settings remain confined to that profile; Mac hardware uses its Apple profile.
+
+On the RTX 5070, the latest eight-prompt runs measured 296.5 to 296.95 tokens/sec against
+272.75 to 273.25 in matching controls, with identical generated IDs. Those numbers use the
+Purrview benchmark harness, not this page's three-prompt test. The updated Mac build needs a new
+measurement; the earlier M1 results above are historical.
+
 ## Try it
+
+Open the [live benchmark](https://ar5en1c.github.io/gemma4-webgpu-engine/) on your Mac, choose
+**Profile this device**, then **Run benchmark**. Keep the page in front until it finishes and use
+**Copy result JSON** to save the build, GPU details, generated text, and timings. If the page
+reports an older cached build, use its **Load the current build** link.
 
 The bench page profiles your GPU first, with no download, and only fetches weights if you ask it to.
 
@@ -81,7 +98,7 @@ point it somewhere else.
 
 ## How it is built
 
-39 source files, about 18,500 lines of TypeScript and WGSL, no runtime dependencies.
+TypeScript and WGSL source under `src/`, with no runtime dependencies.
 
 - `plan.ts` builds a forward pass as a list of dispatches before anything touches the GPU, which is
   what makes the prefill exit a scheduling change rather than a kernel change.

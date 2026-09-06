@@ -43,9 +43,11 @@ import {
 import { geluMulOracle } from './geluMul';
 import {
   foldedDispatch,
+  foldedSplitDispatch,
   gemvGeometry,
   gemvRowsPerWorkgroup,
   K_SPAN_PER_ITER,
+  kSplitsOf,
   matmulReducePrelude,
   prologueWgsl,
   qgemvOracle,
@@ -68,9 +70,20 @@ import type { GemvBits, GemvGeometry, GemvPrologue, MatmulReduceVariant } from '
  */
 export const GEMV_WIDE_COLS = 2;
 
-/** Registry names, `qgemv-<bits>bit[-gelu]-m4`. */
-export function gemvWideKernelName(bits: GemvBits, prologue: GemvPrologue = 'none'): string {
-  return `qgemv-${bits}bit${prologue === 'gelu' ? '-gelu' : ''}-m${GEMV_WIDE_COLS}`;
+/**
+ * Registry names, `qgemv-<bits>bit[-gelu][-split]-m2`. The split form exists for the 2-bit gelu
+ * kernel alone, and it is named the way the one column split is named (qgemv.ts
+ * GEMV_GELU_SPLIT_KERNEL_2BIT): a verify pass under a profile that folds down_proj resolves the
+ * plan's `qgemv-2bit-gelu-split` onto `qgemv-2bit-gelu-split-m2` (execute.ts gemvWide), so the
+ * wide pass folds the same K cut the one token step folds instead of running the 96 workgroup
+ * shape the split exists to avoid. On the 5070 that unsplit shape was 1.19 ms of a wide pass's
+ * 1.73 ms GPU excess (lab-results/5070-wide-pass-breakdown-sep05.json).
+ */
+export function gemvWideKernelName(bits: GemvBits, prologue: GemvPrologue = 'none', split = false): string {
+  if (split && (bits !== 2 || prologue !== 'gelu')) {
+    throw new Error(`the wide split form exists for the 2-bit gelu kernel only, not ${bits}-bit ${prologue}`);
+  }
+  return `qgemv-${bits}bit${prologue === 'gelu' ? '-gelu' : ''}${split ? '-split' : ''}-m${GEMV_WIDE_COLS}`;
 }
 
 const WIDE_PARAMS_WGSL = `struct GemvParams {
@@ -83,7 +96,9 @@ const WIDE_PARAMS_WGSL = `struct GemvParams {
   outScale: f32,
   // vec4 stride between activation columns, K / 4.
   kVec4: u32,
-  pad2: u32,
+  // The gelu prologue's up read offset in vec4s (qgemv.ts prologueWgsl), 0 on every wide site:
+  // the in place PLE row read is a one token step's, and a verify pass copies the row instead.
+  upOffset: u32,
 }`;
 
 const SRQ_WGSL = `const SRQ_MAX: f32 = 127.0;
@@ -169,9 +184,13 @@ export function qgemvWideWgsl(
   geometry: Readonly<GemvGeometry> = gemvGeometry(bits),
   prologue: GemvPrologue = 'none',
   cols: number = GEMV_WIDE_COLS,
+  split = false,
 ): string {
   if (cols % COLS_PER_LANE !== 0) throw new Error(`qgemv wide takes a multiple of ${COLS_PER_LANE} columns, got ${cols}`);
-  if (bits === 2) return qgemv2TileWideWgsl(variant, geometry, prologue, cols);
+  if (split && (bits !== 2 || prologue !== 'gelu')) {
+    throw new Error(`qgemv wide: the K split is implemented on the 2-bit gelu tile only, not ${bits}-bit ${prologue}`);
+  }
+  if (bits === 2) return qgemv2TileWideWgsl(variant, geometry, prologue, cols, split);
   if (geometry.inner !== undefined && geometry.inner !== 'classic') {
     throw new Error(`qgemv-${bits}bit-m${cols} has only the classic inner loop, got ${geometry.inner}`);
   }
@@ -299,8 +318,16 @@ ${stores}
  * sixteen bit halves split per column after each block of sixteen iterations, the zero point
  * taken off with each column's own activation code sum. The f32 head path shares the unpacked
  * code per row across the two columns in the one column head's order.
+ *
+ * THE K SPLIT, on the gelu build only (`split`), is the one column tile's split to the letter
+ * (qgemv.ts qgemv2TileWgsl): the split rides on wid.z, a split owns whole 128 wide bands of K,
+ * and each partial closes with `xs * scales[row] * sum` and NO output snap, which the fold owns
+ * (qgemv-merge). The partials are laid out column major then row then split,
+ * `dst[((col * numRows) + row) * KS + split]`, so the fold reads them as `cols * numRows` rows of
+ * KS partials and writes the wide family's own column major output. An unsplit build (KS 1) is
+ * the unsplit wide kernel to the byte, which the k-matmul check holds.
  */
-function qgemv2TileWideWgsl(variant: MatmulReduceVariant, geometry: Readonly<GemvGeometry>, prologue: GemvPrologue, cols: number): string {
+function qgemv2TileWideWgsl(variant: MatmulReduceVariant, geometry: Readonly<GemvGeometry>, prologue: GemvPrologue, cols: number, split = false): string {
   const xr = (expr: string): string => (prologue === 'gelu' ? `act(${expr})` : `x[${expr}]`);
   const groups = cols / COLS_PER_LANE;
   const W = 32 * groups;
@@ -309,6 +336,9 @@ function qgemv2TileWideWgsl(variant: MatmulReduceVariant, geometry: Readonly<Gem
     throw new Error(`qgemv-2bit-m${cols} is built on the 32 lane, sixteen row tile geometry, got ${geometry.workgroupSize}/${geometry.rowsPerVsg}`);
   }
   if (inner !== 'tile16u') throw new Error(`qgemv-2bit-m${cols} has only the tile16u loop, got ${inner}`);
+  // The split is a property of the kernel, never of the shared geometry: the unsplit wide builds
+  // read KS 1 whatever a profile set, exactly as qgemv-2bit and the lm_head do (qgemv.ts).
+  const KS = split ? kSplitsOf(geometry) : 1;
   const rows = Array.from({ length: 16 }, (_, r) => r);
   const pairs = Array.from({ length: 8 }, (_, m) => m);
   const cs = [0, 1];
@@ -335,9 +365,15 @@ function qgemv2TileWideWgsl(variant: MatmulReduceVariant, geometry: Readonly<Gem
   ].join('\n')).join('\n');
   const stores = cs.map((c) => [
     `    if (colBase + ${c}u < params.cols) {`,
-    ...rows.map((r) => `      if (row0 + ${r}u < params.numRows) { dst[(colBase + ${c}u) * params.numRows + row0 + ${r}u] = srqOut((xs * scales[row0 + ${r}u]) * sum${r}_${c}); }`),
+    ...rows.map((r) => (KS === 1
+      ? `      if (row0 + ${r}u < params.numRows) { dst[(colBase + ${c}u) * params.numRows + row0 + ${r}u] = srqOut((xs * scales[row0 + ${r}u]) * sum${r}_${c}); }`
+      // The split cut is the LAST linear step, as in the one column split: the partial carries
+      // its row scale and the fold owns the snap.
+      : `      if (row0 + ${r}u < params.numRows) { dst[((colBase + ${c}u) * params.numRows + row0 + ${r}u) * ${KS}u + split] = (xs * scales[row0 + ${r}u]) * sum${r}_${c}; }`)),
     '    }',
   ].join('\n')).join('\n');
+  const from = KS === 1 ? '0u' : 'kLo';
+  const to = KS === 1 ? 'iters' : 'kHi';
 
   return /* wgsl */ `${matmulReducePrelude(variant, W)}
 ${WIDE_PARAMS_WGSL}
@@ -362,15 +398,21 @@ fn main(
   let lastTile = (params.numRows - 1u) / 16u;
   let tileBase = min(tile, lastTile) * params.kWords * 4u;
   let iters = params.kWords / 8u;
-${columnBases(COLS_PER_LANE)}
+${KS === 1 ? '' : `  // This workgroup's slice of K. wid.z is the split and num_workgroups.z is the split
+  // count, so the cut needs no room in the params block (qgemv.ts qgemv2TileWgsl).
+  let split = wid.z;
+  let per = (iters + ${KS - 1}u) / ${KS}u;
+  let kLo = min(split * per, iters);
+  let kHi = min(kLo + per, iters);
+`}${columnBases(COLS_PER_LANE)}
 ${cs.flatMap((c) => rows.map((r) => `  var acc${r}_${c} = 0.0;`)).join('\n')}
   if (params.inScale != 0.0) {
 ${cs.flatMap((c) => rows.map((r) => `    var acc${r}_${c}i: i32 = 0;`)).join('\n')}
 ${cs.flatMap((c) => pairs.map((m) => `    var p${m}_${c}: i32 = 0;`)).join('\n')}
 ${cs.map((c) => `    var sx_${c}: i32 = 0;`).join('\n')}
-    var i = 0u;
-    while (i < iters) {
-      let stop = min(i + 16u, iters);
+    var i = ${from};
+    while (i < ${to}) {
+      let stop = min(i + 16u, ${to});
       for (; i < stop; i = i + 1u) {
         let v = wq[tileBase + i * 32u + lane];
 ${cs.map((c) => `        let xk_${c} = srqIn(${xr(`cb${c} + i * 32u + lane`)});`).join('\n')}
@@ -382,7 +424,7 @@ ${flush}
 ${cs.flatMap((c) => rows.map((r) => `    acc${r}_${c} = f32(acc${r}_${c}i - 2 * sx_${c});`)).join('\n')}
   } else {
 ${cs.map((c) => `    var sxf_${c} = 0.0;`).join('\n')}
-    for (var i = 0u; i < iters; i = i + 1u) {
+    for (var i = ${from}; i < ${to}; i = i + 1u) {
       let v = wq[tileBase + i * 32u + lane];
 ${cs.map((c) => `      let xk_${c} = ${xr(`cb${c} + i * 32u + lane`)};`).join('\n')}
 ${headBody}
@@ -454,6 +496,7 @@ export function gemvWideParams(
   inScale: number,
   outScale: number,
   kVec4: number,
+  upOffset = 0,
 ): ArrayBuffer {
   const buf = new ArrayBuffer(32);
   const u = new Uint32Array(buf);
@@ -465,14 +508,14 @@ export function gemvWideParams(
   f[4] = inScale;
   f[5] = outScale;
   u[6] = kVec4;
-  u[7] = 0;
+  u[7] = upOffset;
   return buf;
 }
 
-function bindGemvWide(bits: GemvBits, prologue: GemvPrologue = 'none') {
+function bindGemvWide(bits: GemvBits, prologue: GemvPrologue = 'none', split = false) {
   return (input: KernelBindInput): KernelBindResult => {
     const { device, inputs, output, params } = input;
-    const name = gemvWideKernelName(bits, prologue);
+    const name = gemvWideKernelName(bits, prologue, split);
     const k = params.k | 0;
     const numRows = params.numRows | 0;
     const cols = params.cols | 0;
@@ -486,6 +529,9 @@ function bindGemvWide(bits: GemvBits, prologue: GemvPrologue = 'none') {
     const kWords = wordsPerRow(bits, k);
     const geometry = gemvGeometry(bits);
     const kIters = Math.floor(kWords / (32 * geometry.wordsPerLane));
+    // The K split rides on z exactly as the one column split does (qgemv.ts bindGemv), and only
+    // the split kernel reads it: the unsplit wide builds dispatch the grid they always did.
+    const kSplits = split && bits === 2 ? kSplitsOf(geometry) : 1;
     const wq = inputs.wq;
     const scales = inputs.scales;
     if (!wq || !scales) throw new Error(`${name} needs inputs named wq and scales`);
@@ -511,7 +557,7 @@ function bindGemvWide(bits: GemvBits, prologue: GemvPrologue = 'none') {
     const uniform = kernelUniform(
       input,
       `${name} params`,
-      gemvWideParams(kWords, kIters, numRows, cols, inScale, outScale, k / 4),
+      gemvWideParams(kWords, kIters, numRows, cols, inScale, outScale, k / 4, params.upOffset ?? 0),
     );
     return {
       layout,
@@ -519,9 +565,9 @@ function bindGemvWide(bits: GemvBits, prologue: GemvPrologue = 'none') {
       // The 2-bit tile covers sixteen rows a workgroup whatever the column count; the 4-bit and
       // 8-bit path trades rows for columns, so its workgroup covers fewer rows than the one
       // column kernel's and needs proportionally more workgroups to reach numRows.
-      dispatch: foldedDispatch(Math.ceil(numRows / (bits === 2
+      dispatch: foldedSplitDispatch(Math.ceil(numRows / (bits === 2
         ? gemvRowsPerWorkgroup(geometry)
-        : gemvWideRowsPerWorkgroup(geometry, cols)))),
+        : gemvWideRowsPerWorkgroup(geometry, cols))), kSplits),
       dispose: uniform.dispose,
     };
   };
@@ -532,18 +578,19 @@ function bindGemvWide(bits: GemvBits, prologue: GemvPrologue = 'none') {
 const SRQ_IN_THIRDS = 0.1875;
 const SRQ_OUT = 0.0625;
 
-function wideKernel(bits: GemvBits, prologue: GemvPrologue, cases: Kernel['cases']): Kernel {
-  const name = gemvWideKernelName(bits, prologue);
+function wideKernel(bits: GemvBits, prologue: GemvPrologue, cases: Kernel['cases'], split = false): Kernel {
+  const name = gemvWideKernelName(bits, prologue, split);
   return {
     name,
-    get wgsl(): string { return qgemvWideWgsl(bits, 'subgroup', undefined, prologue); },
+    get wgsl(): string { return qgemvWideWgsl(bits, 'subgroup', undefined, prologue, undefined, split); },
     entry: 'main',
     note:
       `${name}: the ${bits}-bit decode GEMV${prologue === 'gelu' ? ' with the gelu prologue' : ''} over up to `
       + `${GEMV_WIDE_COLS} activation columns from one weight stream, column for column the one column kernel. `
-      + 'The speculative verify pass runs the decoder on it (docs/ENGINE-PLAN.md round 5 ledger).',
+      + 'The speculative verify pass runs the decoder on it (docs/ENGINE-PLAN.md round 5 ledger).'
+      + (split ? ' The split K build: writes partials for the plan\'s fold, never dispatched without one.' : ''),
     cases,
-    bind: bindGemvWide(bits, prologue),
+    bind: bindGemvWide(bits, prologue, split),
   };
 }
 
@@ -634,6 +681,24 @@ export const qgemv2GeluWideKernel: Kernel = wideKernel(2, 'gelu', [
   },
 ]);
 
+/**
+ * The split K build of the wide 2-bit gelu kernel, which a verify pass runs for down_proj under a
+ * profile that folds it. Its one harness case is the unsplit case: at kSplits 1 the split build is
+ * the unsplit build, so it owes the same answer exactly; the split itself is held to the CPU
+ * model of the cut in the k-matmul check, as the one column split is.
+ */
+export const qgemv2GeluSplitWideKernel: Kernel = wideKernel(2, 'gelu', [
+  {
+    name: 'synthetic-8x1024-gelu-m4-srq-unsplit',
+    inputs: { wq: 'kmm.gemv2.tile.wq', scales: 'kmm.gemv2.scales', gate: 'kmm.gelu.gate4.1024', up: 'kmm.gelu.up4.1024' },
+    expected: 'kmm.gemv2.gelu.m4.srq.expected',
+    params: { k: 1024, numRows: 8, cols: GEMV_WIDE_COLS, inScale: SRQ_IN_THIRDS, outScale: SRQ_OUT },
+    tolAbs: 0,
+    tolUlp: 0,
+    note: 'At kSplits 1 the wide split build is the wide gelu build, so it owes the same answer exactly.',
+  },
+], true);
+
 export const qgemv8GeluWideKernel: Kernel = wideKernel(8, 'gelu', [
   {
     name: 'synthetic-10x256-gelu-m4-srq',
@@ -653,3 +718,7 @@ export const QGEMV8_WIDE_FALLBACK_WGSL = qgemvWideWgsl(8, 'workgroup');
 export const QGEMV4_GELU_WIDE_FALLBACK_WGSL = qgemvWideWgsl(4, 'workgroup', undefined, 'gelu');
 export const QGEMV2_GELU_WIDE_FALLBACK_WGSL = qgemvWideWgsl(2, 'workgroup', undefined, 'gelu');
 export const QGEMV8_GELU_WIDE_FALLBACK_WGSL = qgemvWideWgsl(8, 'workgroup', undefined, 'gelu');
+/** The split build's portable form is read at build time against the live geometry (pipeline.ts), like the one column split's. */
+export function qgemv2GeluSplitWideFallbackWgsl(): string {
+  return qgemvWideWgsl(2, 'workgroup', undefined, 'gelu', undefined, true);
+}

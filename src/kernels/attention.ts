@@ -94,6 +94,62 @@ export type AttnReducePath = 'subgroup' | 'workgroup';
  */
 export interface AttentionGeometry {
   slices: 1 | 2 | 4 | 8;
+  /**
+   * How many WORKGROUPS share one (position, head), each taking every `kvSplits`th block of the
+   * window and writing an unnormalised softmax partial that `attention-decode-merge` folds.
+   *
+   * WHY THIS IS A DIFFERENT AXIS FROM `slices`, WHICH ALREADY EXISTS. `slices` makes one workgroup
+   * wider. A workgroup runs on one core, so no value of `slices` puts work on a second core. The
+   * decode dispatch is (qCount, heads), which is EIGHT workgroups, and eight is all the parallelism
+   * this kernel has ever had whatever `slices` said.
+   *
+   * WHY IT DEFAULTS TO 1, WHICH IS THE SHIPPED KERNEL TO THE BYTE. On the M1 eight workgroups is
+   * already the knee: one through eight cost the same 0.037 ms and sixteen costs 1.64x
+   * (gemma4-kernels-lab/lab-results/m1-attention-occupancy-sep04.json). That is also why round 5
+   * promoted slices to workgroups and measured exactly zero. On a part with six times the cores the
+   * knee must sit elsewhere, and attention there costs 2.62 ms of a 5.4 ms token at 11.3 GB/s. So
+   * this is a per device setting whose default changes nothing, not a new shipped shape.
+   */
+  kvSplits?: 1 | 2 | 4 | 8 | 16;
+  /**
+   * Independent accumulators the weighted V loop carries, breaking its dependency chain by this
+   * factor.
+   *
+   * ROUND 5 FIXED THE SHORTER CHAIN AND LEFT THE LONGER ONE. It found the attention stall is
+   * inside the lane rather than in barriers or scheduling, and cut the SCORE loop's chain from
+   * headDim4 to headDim4 over 4 with four accumulators, worth about 1.25 ms a token. The weighted
+   * V loop has the same shape and was not touched: 64 iterations, ONE accumulator, and every
+   * iteration also waits on its own global read of a different 1 KB row. At headDim 256 that
+   * leaves a chain of 64 where the score loop now has 16, so the loop round 5 did not fix is now
+   * the longer of the two.
+   *
+   * 1 is the shipped kernel to the byte. This reassociates the V sum, the same class of change as
+   * the slice count under round 3 lead ruling 5, so it is gated rather than argued and defaults
+   * off until it is measured on both machines.
+   */
+  vAccumulators?: 1 | 2 | 4 | 8 | 16;
+  /**
+   * Independent accumulators in the SCORE loop, the dot of q against one K row. The shipped kernel
+   * carries four (see THE SCORE, ON FOUR ACCUMULATORS in the shader), which is 16 dependent loads
+   * deep at head dimension 256 and 32 at 512. Eight and sixteen cut that chain by two and four.
+   * The per kernel timing on the 5070 (lab-results/5070-per-kernel-decode-sep04.json) found the
+   * stall inside the lane, and the dead chunk skip family measured that a dispatch of one chunk
+   * walks is bound by that chain and nothing else. Default 4 is the shipped text to the byte.
+   * Like vAccumulators this reassociates a sum and is gated, not argued.
+   */
+  scoreAccumulators?: 4 | 8 | 16;
+  /**
+   * How the score loop is laid across the lanes. 'rows', the shipped kernel: each lane walks its
+   * own K row, so a warp's load touches 32 rows for 16 bytes each. 'dims': the lanes of each 32
+   * lane group span the head dimension, positions are iterated, each position's dot closes with
+   * one sgSum32 butterfly and lands in the lane that owns that position, so a warp's load is 512
+   * contiguous bytes. The o family measured the rows loop getting SLOWER with more loads in flight
+   * while the coalesced V loop got faster, which is what a transaction bound loop does beside a
+   * latency bound one. 'dims' needs the butterfly, so under the workgroup reduce policy it falls
+   * back to 'rows'. scoreAccumulators has no meaning under 'dims' and is ignored there. Default
+   * 'rows' is the shipped text to the byte. A different f32 association of the dot, gated.
+   */
+  scoreLayout?: 'rows' | 'dims';
 }
 
 /** The round 3 shape, kept as the sweep's control and the shape the fixtures were first proved at. */
@@ -116,6 +172,56 @@ function assertGeometry(g: AttentionGeometry): void {
   if (s !== 1 && s !== 2 && s !== 4 && s !== 8) {
     throw new Error(`attention geometry: slices must be 1, 2, 4 or 8, got ${String(s)}`);
   }
+  const k = (g.kvSplits ?? 1) as number;
+  if (k !== 1 && k !== 2 && k !== 4 && k !== 8 && k !== 16) {
+    throw new Error(`attention geometry: kvSplits must be 1, 2, 4, 8 or 16, got ${String(k)}`);
+  }
+  const a = (g.vAccumulators ?? 1) as number;
+  if (a !== 1 && a !== 2 && a !== 4 && a !== 8 && a !== 16) {
+    throw new Error(`attention geometry: vAccumulators must be 1, 2, 4, 8 or 16, got ${String(a)}`);
+  }
+  const sa = (g.scoreAccumulators ?? 4) as number;
+  if (sa !== 4 && sa !== 8 && sa !== 16) {
+    throw new Error(`attention geometry: scoreAccumulators must be 4, 8 or 16, got ${String(sa)}`);
+  }
+  const sl = (g.scoreLayout ?? 'rows') as string;
+  if (sl !== 'rows' && sl !== 'dims') {
+    throw new Error(`attention geometry: scoreLayout must be rows or dims, got ${String(sl)}`);
+  }
+}
+
+/**
+ * The largest split the geometry allows, which is what the partial slot is sized at so a plan
+ * taken on one machine can be replayed on another.
+ */
+export const ATTENTION_MAX_KV_SPLITS = 8;
+
+/** Splits this geometry asks for, with the default that means "the shipped kernel". */
+export function kvSplitsOf(geometry: Readonly<AttentionGeometry>): number {
+  return geometry.kvSplits ?? 1;
+}
+
+
+/**
+ * The same geometry with the KV split removed. attention-prefill builds through this. Before it
+ * existed bindAttention read the split off the geometry singleton for every attention dispatch, so
+ * turning kvSplits on for decode split PREFILL too; execute.ts routes partials to attn.part only on
+ * the decode path, so prefill wrote unfolded partials into the plain attn slot and the prompt was
+ * attended wrongly before the first token was ever sampled. The split now rides on kernel identity.
+ */
+export function unsplitAttentionGeometry(geometry: Readonly<AttentionGeometry>): Readonly<AttentionGeometry> {
+  return kvSplitsOf(geometry) === 1 ? geometry : Object.freeze({ ...geometry, kvSplits: 1 });
+}
+
+/** The split KV decode build. Emitted by the plan only alongside ROLE_ATTN_MERGE. */
+export const ATTENTION_DECODE_SPLIT_KERNEL = 'attention-decode-split';
+
+/**
+ * vec4 lanes one (position, head, split) partial occupies: the accumulator, then one lane carrying
+ * the running max in .x and the running sum in .y. Exported so a caller can size the scratch.
+ */
+export function partialStride4(headDim4: number): number {
+  return headDim4 + 1;
 }
 
 /**
@@ -159,9 +265,87 @@ export function attentionGeometry(): Readonly<AttentionGeometry> {
  *    through a 0 * x product (rule 5's data level masking).
  *  - Three storage buffers plus one uniform, against the adapter budget of 10 (risk 6).
  */
+/** 0..n-1, so the generated unroll reads as a list rather than a loop of string concatenation. */
+function vaRange(n: number): number[] {
+  return Array.from({ length: n }, (_, i) => i);
+}
+
+/** `(d0 + d1) + (d2 + d3)` and its wider siblings: the chains folded pairwise, balanced. */
+function pairwiseSum(names: string[]): string {
+  if (names.length === 1) return names[0]!;
+  const half = names.length / 2;
+  return `(${pairwiseSum(names.slice(0, half))} + ${pairwiseSum(names.slice(half))})`;
+}
+
+/**
+ * The score loop at `sa` accumulators, for sa above the shipped four. Same loads, same dots, same
+ * clamp; only how many partial sums are in flight, and therefore the f32 association of the dot.
+ * The main loop steps by sa and the tail loop runs zero times at the two head dimensions this
+ * model has, exactly as the four accumulator text's tail does.
+ */
+function scoreBlock(sa: number): string {
+  const ds = vaRange(sa).map((a) => `d${a}`);
+  return [
+    `    // ${sa} independent chains over the head dimension, so ${sa} loads and ${sa} multiply adds`,
+    '    // are in flight instead of four. Same loads, same dots; only the association moves.',
+    ...ds.map((d) => `    var ${d} = 0.0;`),
+    `    let n4xN = (n4 / ${sa}u) * ${sa}u;`,
+    `    for (var i = 0u; i < n4xN; i = i + ${sa}u) {`,
+    `      d0 = d0 + dot(q[qBase + i], cache[kBase + i]);`,
+    ...ds.slice(1).map((d, k) => `      ${d} = ${d} + dot(q[qBase + i + ${k + 1}u], cache[kBase + i + ${k + 1}u]);`),
+    '    }',
+    '    for (var i = n4xN; i < n4; i = i + 1u) {',
+    '      d0 = d0 + dot(q[qBase + i], cache[kBase + i]);',
+    '    }',
+    `    var d = ${pairwiseSum(ds).slice(1, -1)};`,
+  ].join('\n');
+}
+
+/**
+ * THE TRANSPOSED SCORE LOOP, scoreLayout 'dims'. Each aligned group of 32 lanes owns 32 of the
+ * chunk's 64 positions, the ones its lanes own for the rest of the iteration (lane sl owns position
+ * winLo + c * 64 + sl, and sl = g * 32 + gl). For each position the group's lanes read the K row
+ * across the head dimension, vec4 gl, gl + 32 and at head dimension 512 gl + 64 and gl + 96, so
+ * every load instruction is 32 lanes by 16 contiguous bytes; each lane dots its slice against the
+ * same slice of q; one butterfly closes the sum in every lane; and a select lands it in the one lane
+ * whose position it is. Four positions are in flight per step so the loads pipeline. Nothing after
+ * this line changes: `d` is the score in the lane that owns the position, exactly as the rows loop
+ * leaves it. The clamp keeps every read on a real row and the mask is applied to the RESULT below,
+ * as before. The butterfly is in uniform control flow: the loop bounds are constants.
+ */
+function dimsScoreBlock(): string {
+  const U = 4;
+  const us = vaRange(U);
+  return [
+    '    // The transposed score: lanes across the head dimension, positions iterated, one butterfly',
+    '    // a position. See dimsScoreBlock in attention.ts.',
+    '    let g = (lid >> 5u) & 1u;',
+    '    let gl = lid & 31u;',
+    `    let rowBase = winLo + c * ${SLICE_LANES}u + g * 32u;`,
+    '    var d = 0.0;',
+    `    for (var t = 0u; t < 32u; t = t + ${U}u) {`,
+    ...us.map((u) => `      let jt${u} = min(rowBase + t + ${u}u, params.kvLen - 1u) * n4;`),
+    ...us.map((u) => `      var pt${u} = 0.0;`),
+    '      for (var v = 0u; v < n4; v = v + 32u) {',
+    '        let qv = q[qBase + gl + v];',
+    ...us.map((u) => `        pt${u} = pt${u} + dot(qv, cache[jt${u} + gl + v]);`),
+    '      }',
+    ...us.map((u) => `      let tot${u} = sgSum32(pt${u});`),
+    ...us.map((u) => `      d = select(d, tot${u}, gl == t + ${u}u);`),
+    '    }',
+  ].join('\n');
+}
+
 export function attentionWgsl(reduce: AttnReducePath, geometry: Readonly<AttentionGeometry> = activeGeometry): string {
   assertGeometry(geometry as AttentionGeometry);
   const S = geometry.slices;
+  const KS = kvSplitsOf(geometry);
+  const VA = geometry.vAccumulators ?? 1;
+  const SA = geometry.scoreAccumulators ?? 4;
+  const DIMS = reduce === 'subgroup' && (geometry.scoreLayout ?? 'rows') === 'dims';
+  // Workers dealing the window between them: the slices of every split. At KS 1 this is S and
+  // every expression below collapses to the shipped text, which the gate asserts byte for byte.
+  const WK = S * KS;
   const W = SLICE_LANES * S;
   const sliceMask = SLICE_LANES - 1;
   const head = reduce === 'subgroup'
@@ -255,7 +439,8 @@ struct AttnParams {
   windowLen: u32,
   // V region offset in vec4 lanes inside the packed cache: maxContext * headDim / 4.
   vBase4: u32,
-  pad0: u32,
+  // Splits sharing this (position, head). 1 on the shipped path, where it is never read.
+  kvSplits: u32,
 }
 
 @group(0) @binding(0) var<storage, read> q: array<vec4<f32>>;
@@ -275,6 +460,11 @@ fn main(
   let h = wid.y;
   let slice = lid >> 6u;
   let sl = lid & ${sliceMask}u;
+${KS === 1 ? '' : `  // This workgroup's place among the ${KS} sharing this (position, head). The window is dealt to
+  // ${WK} workers, slice by slice within a split, so worker w takes chunks w, w + ${WK}, ...
+  let split = wid.z;
+  let worker = ${S === 1 ? 'split' : `split * ${S}u + slice`};
+`}
   let n4 = params.headDim4;
   let p = params.qStart + qi;
   let qBase = (qi * params.heads + h) * n4;
@@ -321,9 +511,21 @@ fn main(
   let winLo = select(0u, p + 1u - min(p + 1u, params.windowLen), params.windowLen != 0u);
   let span = select(p + 1u, min(params.windowLen, p + 1u), params.windowLen != 0u);
   let spanChunks = (span + ${SLICE_LANES - 1}u) / ${SLICE_LANES}u;
-  let perSlice = (spanChunks + ${S - 1}u) / ${S}u;
+  let perSlice = (spanChunks + ${WK - 1}u) / ${WK}u;
   for (var it = 0u; it < perSlice; it = it + 1u) {
-    let c = it * ${S}u + slice;
+    let c = it * ${WK}u + ${KS === 1 ? 'slice' : 'worker'};${S === 1 && KS > 1 ? `
+    // THE DEAD CHUNK SKIP. Chunks are dealt round robin over the ${WK} workers whatever the
+    // context, so at 5 chunks workers 5 to ${WK - 1} walk a chunk with every lane masked: every
+    // load, every barrier, folded at weight exp(-3e38 - m), which is exactly zero. On the 5070 at
+    // 299 positions that is 24 of 64 workgroups, on a dispatch already past the part's 32
+    // workgroup knee; at 16 positions it is 56 of 64. A masked chunk leaves every accumulator
+    // unchanged to the bit (correction exp(0), probabilities exp(-3e38 - m), both exact), so
+    // skipping it changes no number. At one slice c is uniform across the workgroup, so the skip
+    // sits above the barriers legally; at more slices c is per slice and there is no skip. The
+    // DISPATCH stays (qCount, heads, kvSplits): the runtime's decode step cache holds a step's
+    // dispatch fixed across positions and refuses one that moves, so the dead workers launch,
+    // skip and write their empty partial rather than never existing.
+    if (c >= spanChunks) { continue; }` : ''}
     let j = winLo + c * ${SLICE_LANES}u + sl;
     // Causal plus sliding mask, evaluated as data. j + windowLen > p is the inclusive
     // [p - windowLen + 1, p] window without underflowing unsigned arithmetic. A chunk past the
@@ -353,7 +555,7 @@ fn main(
     // replaces it: the arbiters are the layer 0 activation gate, the logit top-k overlap and
     // cosine, and a moved token table where a flip counts as a defect only where the reference's
     // own top two gap at that position exceeds 1.0 logit. This kernel is kept under those.
-    var d0 = 0.0;
+${DIMS ? dimsScoreBlock() : SA === 4 ? `    var d0 = 0.0;
     var d1 = 0.0;
     var d2 = 0.0;
     var d3 = 0.0;
@@ -367,7 +569,7 @@ fn main(
     for (var i = n4x4; i < n4; i = i + 1u) {
       d0 = d0 + dot(q[qBase + i], cache[kBase + i]);
     }
-    var d = (d0 + d1) + (d2 + d3);
+    var d = (d0 + d1) + (d2 + d3);` : scoreBlock(SA)}
     var s = ${MASKED_SCORE};
     if (valid) {
       s = d * ATTN_SCALE;
@@ -390,7 +592,7 @@ ${chunkReduce}
     acc0 = acc0 * corr;
     acc1 = acc1 * corr;
     let probBase = slice * ${SLICE_LANES}u;
-    for (var t = 0u; t < ${SLICE_LANES}u; t = t + 1u) {
+${VA === 1 ? `    for (var t = 0u; t < ${SLICE_LANES}u; t = t + 1u) {
       let jt = min(winLo + c * ${SLICE_LANES}u + t, params.kvLen - 1u);
       let prob = probScratch[probBase + t];
       let vBase = params.vBase4 + jt * n4;
@@ -398,7 +600,25 @@ ${chunkReduce}
       if (n4 > ${SLICE_LANES}u) {
         acc1 = acc1 + prob * cache[vBase + sl + ${SLICE_LANES}u];
       }
-    }
+    }` : [
+    `    // ${VA} independent chains, so ${VA} loads and ${VA} multiply adds are in flight instead`,
+    '    // of one. Same positions, same probabilities, same values; only the order moves.',
+    ...vaRange(VA).map((a) => `    var p${a} = vec4<f32>(0.0);`),
+    ...vaRange(VA).map((a) => `    var r${a} = vec4<f32>(0.0);`),
+    `    for (var t = 0u; t < ${SLICE_LANES}u; t = t + ${VA}u) {`,
+    ...vaRange(VA).flatMap((a) => [
+      `      let jt${a} = min(winLo + c * ${SLICE_LANES}u + t + ${a}u, params.kvLen - 1u);`,
+      `      let pr${a} = probScratch[probBase + t + ${a}u];`,
+      `      let vb${a} = params.vBase4 + jt${a} * n4;`,
+      `      p${a} = p${a} + pr${a} * cache[vb${a} + sl];`,
+    ]),
+    `      if (n4 > ${SLICE_LANES}u) {`,
+    ...vaRange(VA).map((a) => `        r${a} = r${a} + pr${a} * cache[vb${a} + sl + ${SLICE_LANES}u];`),
+    '      }',
+    '    }',
+    `    acc0 = acc0 + (${vaRange(VA).map((a) => `p${a}`).join(' + ')});`,
+    `    acc1 = acc1 + (${vaRange(VA).map((a) => `r${a}`).join(' + ')});`,
+  ].join('\n')}
     mRun = mNew;
     // The next iteration's guarded store rewrites the scratch this one read; the barrier keeps
     // the read before the write, and it sits in uniform control flow.
@@ -430,17 +650,175 @@ ${chunkReduce}
       o0 = o0 + sliceAcc0[s2 * ${SLICE_LANES}u + lid] * w;
       o1 = o1 + sliceAcc1[s2 * ${SLICE_LANES}u + lid] * w;
     }
-    let outBase = (qi * params.heads + h) * n4;
+${KS === 1 ? `    let outBase = (qi * params.heads + h) * n4;
     let inv = 1.0 / lAll;
     if (lid < n4) {
       out[outBase + lid] = o0 * inv;
     }
     if (lid + ${SLICE_LANES}u < n4) {
       out[outBase + lid + ${SLICE_LANES}u] = o1 * inv;
+    }` : `    // THE PARTIAL, NOT THE ANSWER. This workgroup saw only its ${KS}th of the window, so its
+    // running max and sum are partial and the accumulator must NOT be divided here: dividing by a
+    // partial sum and re-weighting afterwards is not the same number. attention-decode-merge folds
+    // the ${KS} triples with the same online softmax step this kernel already uses across slices.
+    let partBase = ((qi * params.heads + h) * params.kvSplits + split) * (n4 + 1u);
+    if (lid < n4) {
+      out[partBase + lid] = o0;
     }
+    if (lid + ${SLICE_LANES}u < n4) {
+      out[partBase + lid + ${SLICE_LANES}u] = o1;
+    }
+    if (lid == 0u) {
+      out[partBase + n4] = vec4<f32>(mAll, lAll, 0.0, 0.0);
+    }`}
   }
 }
 `;
+}
+
+/**
+ * THE MERGE, which is the other half of kvSplits.
+ *
+ * Each split workgroup wrote an UNNORMALISED triple for its share of the window: the running max in
+ * .x of the trailing lane, the running sum in .y, and the accumulator in the lanes before it. This
+ * folds them with the same online softmax step the split kernel already runs across its slices:
+ * take the max of the maxes, re-weight each split's sum and accumulator by exp(itsMax - theMax),
+ * add, and divide once at the end.
+ *
+ * A split whose blocks all ran past the window carries the masked floor and a sum of zero, so its
+ * weight underflows to zero and it contributes nothing. Split 0 always holds the first block of the
+ * window, so the total is always positive and the single division is always safe. That is the same
+ * argument the cross slice merge already rests on.
+ *
+ * 64 lanes, one workgroup per (position, head), because the output is at most 128 vec4 lanes and
+ * each lane owns lane i and i + 64 exactly as the split kernel's store block does.
+ */
+export function attentionMergeWgsl(): string {
+  return /* wgsl */ `struct MergeParams {
+  headDim4: u32,
+  heads: u32,
+  qCount: u32,
+  qStart: u32,
+  kvLen: u32,
+  windowLen: u32,
+  vBase4: u32,
+  kvSplits: u32,
+}
+
+@group(0) @binding(0) var<storage, read> part: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> out: array<vec4<f32>>;
+@group(0) @binding(2) var<uniform> params: MergeParams;
+
+@compute @workgroup_size(${SLICE_LANES})
+fn main(
+  @builtin(workgroup_id) wid: vec3<u32>,
+  @builtin(local_invocation_index) lid: u32,
+) {
+  let qi = wid.x;
+  let h = wid.y;
+  let n4 = params.headDim4;
+  let stride = n4 + 1u;
+  let base = (qi * params.heads + h) * params.kvSplits * stride;
+
+  // Every lane walks the same splits and computes the same mAll, so this loop and the next are
+  // uniform across the workgroup and need no barrier.
+  var mAll = ${MASKED_SCORE};
+  for (var sp = 0u; sp < params.kvSplits; sp = sp + 1u) {
+    mAll = max(mAll, part[base + sp * stride + n4].x);
+  }
+  var lAll = 0.0;
+  var o0 = vec4<f32>(0.0);
+  var o1 = vec4<f32>(0.0);
+  for (var sp = 0u; sp < params.kvSplits; sp = sp + 1u) {
+    let sbase = base + sp * stride;
+    let ml = part[sbase + n4];
+    let w = exp(ml.x - mAll);
+    lAll = lAll + ml.y * w;
+    o0 = o0 + part[sbase + lid] * w;
+    if (n4 > ${SLICE_LANES}u) {
+      o1 = o1 + part[sbase + lid + ${SLICE_LANES}u] * w;
+    }
+  }
+  let outBase = (qi * params.heads + h) * n4;
+  let inv = 1.0 / lAll;
+  if (lid < n4) {
+    out[outBase + lid] = o0 * inv;
+  }
+  if (lid + ${SLICE_LANES}u < n4) {
+    out[outBase + lid + ${SLICE_LANES}u] = o1 * inv;
+  }
+}
+`;
+}
+
+export const ATTENTION_MERGE_WGSL = attentionMergeWgsl();
+
+/**
+ * The split path as arithmetic, so the fold can be proved in Node without a GPU.
+ *
+ * It deals the window to `splits * slices` workers exactly as the WGSL does, keeps each SPLIT's
+ * own (max, sum, accumulator) triple, and then folds the triples the way attentionMergeWgsl does.
+ * The gate asserts this equals `attentionOracle` to within f32 reassociation, which is the property
+ * the whole change rests on: splitting the window changes the summation order and NOTHING else.
+ */
+export function attentionSplitOracle(
+  q: Float32Array,
+  k: Float32Array,
+  v: Float32Array,
+  shape: AttentionShape,
+  splits: number,
+  slices = 8,
+): Float32Array {
+  const { heads, headDim, qCount, qStart, kvLen, window } = shape;
+  const scale = shape.scale ?? ATTENTION_SCALE;
+  const workers = splits * slices;
+  const out = new Float32Array(qCount * heads * headDim);
+  for (let qi = 0; qi < qCount; qi += 1) {
+    const p = qStart + qi;
+    const winLo = window > 0 ? Math.max(0, p - window + 1) : 0;
+    const span = window > 0 ? Math.min(window, p + 1) : p + 1;
+    const spanChunks = Math.ceil(span / SLICE_LANES);
+    for (let h = 0; h < heads; h += 1) {
+      const qBase = (qi * heads + h) * headDim;
+      // One triple per split, folded from the slices that belong to it.
+      const sm = new Float64Array(splits).fill(-Infinity);
+      const sl = new Float64Array(splits);
+      const sacc = new Float64Array(splits * headDim);
+      for (let w = 0; w < workers; w += 1) {
+        const split = Math.floor(w / slices);
+        for (let c = w; c < spanChunks; c += workers) {
+          for (let t = 0; t < SLICE_LANES; t += 1) {
+            const j = winLo + c * SLICE_LANES + t;
+            if (j >= kvLen || j > p || (window > 0 && j + window <= p)) continue;
+            let d = 0;
+            for (let i = 0; i < headDim; i += 1) d += q[qBase + i] * k[j * headDim + i];
+            const sc = d * scale;
+            const mNew = Math.max(sm[split]!, sc);
+            const corr = Math.exp(sm[split]! - mNew);
+            sl[split] = sl[split]! * corr + Math.exp(sc - mNew);
+            const accBase = split * headDim;
+            for (let i = 0; i < headDim; i += 1) {
+              sacc[accBase + i] = sacc[accBase + i]! * corr + Math.exp(sc - mNew) * v[j * headDim + i]!;
+            }
+            sm[split] = mNew;
+          }
+        }
+      }
+      let mAll = -Infinity;
+      for (let sp = 0; sp < splits; sp += 1) mAll = Math.max(mAll, sm[sp]!);
+      let lAll = 0;
+      const o = new Float64Array(headDim);
+      for (let sp = 0; sp < splits; sp += 1) {
+        const wgt = Math.exp(sm[sp]! - mAll);
+        if (!Number.isFinite(wgt)) continue;
+        lAll += sl[sp]! * wgt;
+        for (let i = 0; i < headDim; i += 1) o[i] += sacc[sp * headDim + i]! * wgt;
+      }
+      const outBase = (qi * heads + h) * headDim;
+      for (let i = 0; i < headDim; i += 1) out[outBase + i] = o[i]! / lAll;
+    }
+  }
+  return out;
 }
 
 /** The default geometry builds, which are what the Node checks lint and the fallback table serves. */
@@ -547,7 +925,7 @@ export function attentionDecodeOracle(
 /** The params block, exported so the scheduler can restage it in place per dispatch. */
 export function attnParams(p: {
   headDim4: number; heads: number; qCount: number; qStart: number;
-  kvLen: number; windowLen: number; vBase4: number;
+  kvLen: number; windowLen: number; vBase4: number; kvSplits?: number;
 }): ArrayBuffer {
   const words = new ArrayBuffer(32);
   const u = new Uint32Array(words);
@@ -558,11 +936,14 @@ export function attnParams(p: {
   u[4] = p.kvLen;
   u[5] = p.windowLen;
   u[6] = p.vBase4;
-  u[7] = 0;
+  u[7] = Math.max(1, Math.trunc(p.kvSplits ?? 1));
   return words;
 }
 
-function bindAttention(input: KernelBindInput): KernelBindResult {
+/** `split` is the kernel's identity, not the geometry's: only `attention-decode-split` passes true. */
+const bindAttention = (split: boolean) => (input: KernelBindInput): KernelBindResult => bindAttentionImpl(input, split);
+
+function bindAttentionImpl(input: KernelBindInput, split: boolean): KernelBindResult {
   const { device, inputs, output, params } = input;
   const headDim = params.headDim | 0;
   const heads = params.heads | 0;
@@ -596,6 +977,12 @@ function bindAttention(input: KernelBindInput): KernelBindResult {
       { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
     ],
   }));
+  // The split rides on z, so an unsplit dispatch is the grid it always was and a split one is the
+  // same grid with a third dimension. The kernel reads its own split from wid.z. The count is the
+  // geometry's, NOT the number of chunks this position has: runtime.ts caches a resolved decode
+  // step across positions and asserts its dispatch does not move, and a dispatch sized to the
+  // context moves every token. Dead splits are cheap instead (the skip in attentionWgsl).
+  const kvSplits = split ? kvSplitsOf(activeGeometry) : 1;
   const uniform = kernelUniform(input, 'attention params', attnParams({
     headDim4: headDim / 4,
     heads,
@@ -604,12 +991,13 @@ function bindAttention(input: KernelBindInput): KernelBindResult {
     kvLen,
     windowLen: window,
     vBase4: (maxContext * headDim) / 4,
+    kvSplits,
   }));
 
   return {
     layout,
     buffers: [qBuf, cacheBuf, output, uniform.binding],
-    dispatch: [qCount, heads, 1],
+    dispatch: [qCount, heads, kvSplits],
     dispose: uniform.dispose,
   };
 }
@@ -638,12 +1026,90 @@ const ATTN_MIN_COSINE = 0.999;
  */
 const ATTN_TOL_ABS = 1e-4;
 
+/**
+ * The fold of a split attention dispatch, as a registry kernel.
+ *
+ * Present only when a device profile asks for `kvSplits`. The split build writes one UNNORMALISED
+ * softmax partial per (position, head, split), each carrying its own running max and weight sum in
+ * the lane past the accumulator, and this takes the max of the maxes, re-weights each partial by
+ * exp(m - mAll), sums, and divides once. That order is the whole correctness argument: a partial
+ * normalised by its own weight sum cannot be added to another one.
+ *
+ * WHY IT IS WORTH A SECOND DISPATCH ON SOME MACHINES AND NOT OTHERS. The dispatch is
+ * (qCount, heads, kvSplits), so unsplit it is 8 workgroups. The M1 has 8 cores and its occupancy
+ * knee is at exactly 8 workgroups, so a split there can only add this pass. The 5070 has 48 SMs
+ * and its knee is at 32, and its winning configurations move the SAME work onto more and smaller
+ * workgroups: 2.74x and 2.99x at slices 1 and kvSplits 8
+ * (lab-results/5070-attention-split-sep04.json). That is why it is a profile field and not a
+ * default, and why this kernel exists but nothing yet turns it on.
+ */
+export const attentionMergeKernel: Kernel = {
+  name: 'attention-decode-merge',
+  get wgsl(): string { return ATTENTION_MERGE_WGSL; },
+  entry: 'main',
+  note:
+    'The fold of a split attention decode. 64 lanes a workgroup, one per (position, head). No '
+    + 'subgroup operation, so the one build serves both reduce policies and it is deliberately '
+    + 'absent from the fallback table.',
+  cases: [
+    {
+      name: 'fold-2heads-2splits',
+      inputs: { part: 'kattn.merge.part' },
+      expected: 'kattn.merge.expected',
+      params: { headDim: 8, heads: 2, qCount: 1, kvSplits: 2 },
+      tolAbs: 1e-6,
+      minCosine: ATTN_MIN_COSINE,
+      note:
+        'Two partials a head with DIFFERENT running maxes, so the re-weighting has work to do. A '
+        + 'shader that summed partials which had each normalised themselves would fail this, '
+        + 'which is the one thing about the split that cannot be argued from the unsplit answer.',
+    },
+  ],
+  bind: (input: KernelBindInput): KernelBindResult => {
+    const { device, inputs, output, params } = input;
+    const headDim = params.headDim | 0;
+    const heads = params.heads | 0;
+    const qCount = params.qCount | 0;
+    const kvSplits = params.kvSplits | 0;
+    if (headDim <= 0 || headDim % 4 !== 0) {
+      throw new Error(`attention-decode-merge needs params.headDim a positive multiple of 4, got ${headDim}`);
+    }
+    if (heads <= 0 || qCount <= 0) {
+      throw new Error('attention-decode-merge needs positive params.heads and params.qCount');
+    }
+    if (kvSplits < 2) {
+      throw new Error(`attention-decode-merge only exists on a split dispatch, got kvSplits ${kvSplits}`);
+    }
+    const part = inputs.part;
+    if (!part) throw new Error('attention-decode-merge needs an input named part');
+    const layout = kernelLayout(input, 'attention-decode-merge', () => device.createBindGroupLayout({
+      label: 'attention-decode-merge',
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+      ],
+    }));
+    // The fold reads headDim4, heads and kvSplits; the window and the positions are the split
+    // build's business and it has already finished with them.
+    const uniform = kernelUniform(input, 'attention-decode-merge params', attnParams({
+      headDim4: headDim / 4, heads, qCount, qStart: 0, kvLen: 1, windowLen: 0, vBase4: 0, kvSplits,
+    }));
+    return {
+      layout,
+      buffers: [part, output, uniform.binding],
+      dispatch: [qCount, heads, 1],
+      dispose: uniform.dispose,
+    };
+  },
+};
+
 export const attentionDecodeKernel: Kernel = {
   name: 'attention-decode',
   // Read at build time against the active attention geometry, so the performance rig's slice
   // sweep reaches the pipeline store through the registry like any other build. The default
   // geometry text is the ATTENTION_WGSL constant above, byte for byte.
-  get wgsl(): string { return attentionWgsl('subgroup'); },
+  get wgsl(): string { return attentionWgsl('subgroup', unsplitAttentionGeometry(activeGeometry)); },
   entry: 'main',
   note:
     'K8, decode shape: one query position against the packed KV cache, per layer kind via '
@@ -676,12 +1142,31 @@ export const attentionDecodeKernel: Kernel = {
       note: 'Same position on the first full attention layer: head_dim 512, no window.',
     },
   ],
-  bind: bindAttention,
+  bind: bindAttention(false),
+};
+
+/**
+ * The split KV sibling of attention-decode, and the only attention kernel allowed to dispatch a z
+ * greater than one. The plan emits this name in place of `attention-decode` exactly when it also
+ * emits ROLE_ATTN_MERGE, so the partials it writes are always folded and prefill can never be
+ * split by a decode profile.
+ *
+ * Its case is the decode entry's, run at the shipped geometry where kvSplits is 1 and the split
+ * build collapses byte for byte to the text attention-decode compiles. The splits at 2, 4 and 8 are
+ * proved directly in scripts/engine-check/k-attention.mjs, which drives the WGSL at an explicit
+ * geometry, because a registry case runs at whatever geometry happens to be active.
+ */
+export const attentionDecodeSplitKernel: Kernel = {
+  ...attentionDecodeKernel,
+  name: ATTENTION_DECODE_SPLIT_KERNEL,
+  get wgsl(): string { return attentionWgsl('subgroup', activeGeometry); },
+  note: 'The split KV decode attention. Writes partials; the plan folds them.',
+  bind: bindAttention(true),
 };
 
 export const attentionPrefillKernel: Kernel = {
   name: 'attention-prefill',
-  get wgsl(): string { return attentionWgsl('subgroup'); },
+  get wgsl(): string { return attentionWgsl('subgroup', unsplitAttentionGeometry(activeGeometry)); },
   entry: 'main',
   note:
     'K8, prefill shape: a chunk of query positions with causal plus sliding masks computed '
@@ -713,5 +1198,5 @@ export const attentionPrefillKernel: Kernel = {
       note: 'Layer 4: partial RoPE arrived baked into q and k, head_dim 512, unwindowed.',
     },
   ],
-  bind: bindAttention,
+  bind: bindAttention(false),
 };
