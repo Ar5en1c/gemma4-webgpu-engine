@@ -728,6 +728,9 @@ export class Gemma4Mobile {
     this.pipelines = new PipelineStore(this.state.gpu, variant);
     const executor = new GpuExecutor({
       batchProjections: this.state.profile.decodeBatchProjections.value,
+      singleTokenGemm: this.state.profile.prefillSingleTokenGemm.value,
+      prefillGemm4Tile: this.state.profile.prefillGemm4Tile.value,
+      prefillDenseTile: this.state.profile.prefillDenseTile.value,
       gpu: this.state.gpu,
       pipelines: this.pipelines,
       buffers: this.state.buffers!,

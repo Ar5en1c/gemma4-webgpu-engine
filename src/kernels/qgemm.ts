@@ -94,8 +94,12 @@ const CHUNK_WORDS = 32;
  * read them back as i32: the bitcast saved one convert per staged value but bought i32 multiplies
  * in every dot of the K loop, which is the wrong side of that trade on this hardware.
  */
-function gemmDomainWgsl(bits: 2 | 4, domain: 'int' | 'float'): string {
-  const mTile = GEMM_M_TILE[bits];
+function gemmDomainWgsl(
+  bits: 2 | 4,
+  domain: 'int' | 'float',
+  scalarColumns = false,
+  mTile: number = GEMM_M_TILE[bits],
+): string {
   const vec4PerWord = CODES_PER_WORD[bits] / 4;
   const chunkVec4 = CHUNK_WORDS * vec4PerWord;
   const stagePerLane = (mTile * chunkVec4) / GEMV_WORKGROUP_SIZE;
@@ -141,6 +145,62 @@ function gemmDomainWgsl(bits: 2 | 4, domain: 'int' | 'float'): string {
   const staged = int
     ? `srqInF(x[min(col, cLast) * params.kVec4 + c * ${chunkVec4}u + off]) * f32(col < params.mCols)`
     : `x[min(col, cLast) * params.kVec4 + c * ${chunkVec4}u + off] * f32(col < params.mCols)`;
+
+  if (scalarColumns) {
+    const cols = Array.from({ length: mTile }, (_, ct) => ct);
+    const accDecls = [0, 1]
+      .flatMap((r) => cols.map((ct) => `    var acc${r}_${ct}: ${accType} = ${zero};`))
+      .join('\n');
+    const compute = cols.map((ct) => `      {
+        let tb = ${ct}u * ${chunkVec4}u + lane * ${vec4PerWord}u;
+${tileLoads}
+          acc0_${ct} = acc0_${ct} + ${rowDots(0)};
+          acc1_${ct} = acc1_${ct} + ${rowDots(1)};
+      }`).join('\n');
+    const reductions = cols.map((ct) => `    let sum0_${ct} = mmSum(f32(acc0_${ct}), lid);
+    let sum1_${ct} = mmSum(f32(acc1_${ct}), lid);`).join('\n');
+    const stores = cols.map((ct) => `      {
+        let col = colBase + ${ct}u;
+        if (col < params.mCols) {
+          if (row0 < params.numRows) {
+            dst[col * params.numRows + row0] = srqOut((xs * scales[row0]) * sum0_${ct});
+          }
+          if (row1 < params.numRows) {
+            dst[col * params.numRows + row1] = srqOut((xs * scales[row1]) * sum1_${ct});
+          }
+        }
+      }`).join('\n');
+
+    return /* wgsl */ `${accDecls}
+
+    for (var c = 0u; c < params.kIters; c = c + 1u) {
+      // Stage. Every lane moves ${stagePerLane} vec4s; a column past mCols stages zeros through a
+      // clamped read, which is the data level masking of ENGINE-PLAN 5.5 rule 5.
+      for (var j = 0u; j < ${stagePerLane}u; j = j + 1u) {
+        let t = j * ${GEMV_WORKGROUP_SIZE}u + lid;
+        let ct = t / ${chunkVec4}u;
+        let off = t % ${chunkVec4}u;
+        let col = colBase + ct;
+        xTile[t] = ${staged};
+      }
+      workgroupBarrier();
+
+      // Compute. One word unpacked per row per lane, its codes reused across all ${mTile} columns.
+      let wi = c * ${CHUNK_WORDS}u + lane;
+${codeDecls}
+${codeLoad(0)}
+${codeLoad(1)}
+${compute}
+      workgroupBarrier();
+    }
+
+    // All reductions above all stores, then one guarded store block. ENGINE-PLAN 5.5 rule 1.
+${reductions}
+    if (lane == 0u) {
+      let xs = ${int ? 'params.inScale' : '1.0'};
+${stores}
+    }`;
+  }
 
   return /* wgsl */ `  var acc0: array<${accType}, ${mTile}>;
     var acc1: array<${accType}, ${mTile}>;
@@ -225,8 +285,7 @@ ${tileLoads}
  * of the workgroup reaches (uniform loop bounds from the params block). Rows past numRows and
  * columns past mCols clamp their reads and fail their store guards.
  */
-function qgemm2TileWgsl(): string {
-  const mTile = GEMM_M_TILE[2];
+function qgemm2TileWgsl(mTile: number = GEMM_M_TILE[2]): string {
   const cols = Array.from({ length: mTile }, (_, c) => c);
   const comps = ['x', 'y', 'z', 'w'];
   // Per 4 k: the lane's four codes out of the four words, then mTile vec4 activation reads (one
@@ -339,9 +398,13 @@ ${cols.map((ct) => `    if (colBase + ${ct}u < params.mCols) { dst[(colBase + ${
  * two uniform scales and the same ratified integer reduction. Prefill and decode therefore run the
  * same arithmetic on the same weights, which is the only way the two paths can agree on a token.
  */
-export function qgemmWgsl(bits: 2 | 4, variant: MatmulReduceVariant): string {
+function buildQgemmWgsl(
+  bits: 2 | 4,
+  variant: MatmulReduceVariant,
+  scalarColumns = false,
+  mTile: number = GEMM_M_TILE[bits],
+): string {
   if (bits === 2) return qgemm2TileWgsl();
-  const mTile = GEMM_M_TILE[bits];
   const vec4PerWord = CODES_PER_WORD[bits] / 4;
   const chunkVec4 = CHUNK_WORDS * vec4PerWord;
 
@@ -416,12 +479,33 @@ fn main(
   // Uniform branch on a uniform buffer value, so both sides keep uniform control flow and their
   // barriers and reductions are legal where they sit.
   if (params.inScale != 0.0) {
-${gemmDomainWgsl(bits, 'int')}
+${gemmDomainWgsl(bits, 'int', scalarColumns, mTile)}
   } else {
-${gemmDomainWgsl(bits, 'float')}
+${gemmDomainWgsl(bits, 'float', scalarColumns, mTile)}
   }
 }
 `;
+}
+
+export function qgemmWgsl(bits: 2 | 4, variant: MatmulReduceVariant): string {
+  return buildQgemmWgsl(bits, variant);
+}
+
+/** Experimental 4-bit GEMM with the eight column loops emitted as explicit scalar code. */
+export function qgemm4ScalarWgsl(variant: MatmulReduceVariant): string {
+  return buildQgemmWgsl(4, variant, true);
+}
+
+/** Dev experiment: caller must dispatch ceil(M / mTile) column workgroups. */
+export function qgemm4TiledWgsl(variant: MatmulReduceVariant, mTile: number, scalarColumns = false): string {
+  if (![1, 4, 8, 16].includes(mTile)) throw Error('Experimental 4-bit GEMM tile must be 1, 4, 8 or 16');
+  return buildQgemmWgsl(4, variant, scalarColumns, mTile);
+}
+
+/** Dev experiment: one or eight token columns on the 2-bit tile layout. */
+export function qgemm2TiledWgsl(mTile: number): string {
+  if (mTile !== 1 && mTile !== 8) throw Error('Experimental 2-bit GEMM tile must be 1 or 8');
+  return qgemm2TileWgsl(mTile);
 }
 
 export const QGEMM4_WGSL = qgemmWgsl(4, 'subgroup');
@@ -429,6 +513,8 @@ export const QGEMM4_WGSL = qgemmWgsl(4, 'subgroup');
 // it has no entry in pipeline.ts FALLBACK_WGSL.
 export const QGEMM2_WGSL = qgemmWgsl(2, 'subgroup');
 export const QGEMM4_FALLBACK_WGSL = qgemmWgsl(4, 'workgroup');
+export const QGEMM4_SINGLE_FALLBACK_WGSL = qgemm4TiledWgsl('workgroup', 1, true);
+export const QGEMM4_PREFILL4_FALLBACK_WGSL = qgemm4TiledWgsl('workgroup', 4, true);
 
 // ---------------------------------------------------------------------------------------------
 // The CPU oracle.
@@ -500,7 +586,7 @@ export function gemmParams(
   return buf;
 }
 
-function bindGemm(bits: 2 | 4) {
+function bindGemm(bits: 2 | 4, mTile: number = GEMM_M_TILE[bits]) {
   return (input: KernelBindInput): KernelBindResult => {
     const { device, inputs, output, params } = input;
     const k = params.k | 0;
@@ -540,7 +626,7 @@ function bindGemm(bits: 2 | 4) {
     // one column tile per workgroup; the 4-bit kernel keeps the row layout's four rows per
     // workgroup.
     const rowGroups = bits === 2 ? Math.ceil(numRows / (4 * TILE_ROWS)) : Math.ceil(numRows / GEMV_ROWS_PER_WORKGROUP);
-    const colTiles = Math.ceil(mCols / GEMM_M_TILE[bits]);
+    const colTiles = Math.ceil(mCols / mTile);
     const folded = foldedDispatch(rowGroups);
     return {
       layout,
@@ -625,4 +711,29 @@ export const qgemm2Kernel: Kernel = {
     },
   ],
   bind: bindGemm(2),
+};
+
+/** Off-by-default one-column prefill variants; production routing is explicit in execute.ts. */
+export const qgemm4SingleKernel: Kernel = {
+  ...qgemm4Kernel,
+  name: 'qgemm-4bit-single',
+  wgsl: qgemm4TiledWgsl('subgroup', 1, true),
+  cases: [...qgemm4Kernel.cases],
+  bind: bindGemm(4, 1),
+};
+
+export const qgemm4Prefill4Kernel: Kernel = {
+  ...qgemm4Kernel,
+  name: 'qgemm-4bit-prefill4',
+  wgsl: qgemm4TiledWgsl('subgroup', 4, true),
+  cases: [...qgemm4Kernel.cases],
+  bind: bindGemm(4, 4),
+};
+
+export const qgemm2SingleKernel: Kernel = {
+  ...qgemm2Kernel,
+  name: 'qgemm-2bit-single',
+  wgsl: qgemm2TiledWgsl(1),
+  cases: [...qgemm2Kernel.cases],
+  bind: bindGemm(2, 1),
 };

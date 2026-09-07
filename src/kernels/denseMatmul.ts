@@ -130,6 +130,77 @@ fn main(
 }
 `;
 
+/** Four-column prefill source screened by scripts/mac-perf/dense-tiled.ts. */
+export function denseMatmulTiledWgsl(): string {
+  const marker = '@compute';
+  const at = DENSE_MATMUL_WGSL.indexOf(marker);
+  if (at < 0 || at !== DENSE_MATMUL_WGSL.lastIndexOf(marker)) {
+    throw new Error('dense tiled source contract requires exactly one @compute marker');
+  }
+  const prefix = DENSE_MATMUL_WGSL.slice(0, at);
+
+  return /* wgsl */ `${prefix}@compute @workgroup_size(${DENSE_WORKGROUP_SIZE})
+fn main(
+  @builtin(workgroup_id) wid: vec3<u32>,
+  @builtin(local_invocation_index) lid: u32,
+) {
+  let row = wid.x * ${DENSE_WORKGROUP_SIZE}u + lid;
+
+  // Decode keeps the original scalar arithmetic and does no tiled work.
+  if (params.mCols == 1u) {
+    let col = wid.y;
+    if (row >= params.numRows || col >= params.mCols) {
+      return;
+    }
+    let base = row * params.kVec4;
+    let xb = col * params.kVec4;
+    var acc = 0.0;
+    for (var i = 0u; i < params.kVec4; i = i + 1u) {
+      acc = acc + dot(bf16x4(w[base + i]), x[xb + i]);
+    }
+    dst[col * params.numRows + row] = params.alpha * acc;
+    return;
+  }
+
+  let colBase = wid.y * 4u;
+  if (row >= params.numRows || colBase >= params.mCols) {
+    return;
+  }
+  let base = row * params.kVec4;
+  let cLast = params.mCols - 1u;
+  let xb0 = min(colBase, cLast) * params.kVec4;
+  let xb1 = min(colBase + 1u, cLast) * params.kVec4;
+  let xb2 = min(colBase + 2u, cLast) * params.kVec4;
+  let xb3 = min(colBase + 3u, cLast) * params.kVec4;
+  var acc0 = 0.0;
+  var acc1 = 0.0;
+  var acc2 = 0.0;
+  var acc3 = 0.0;
+
+  for (var i = 0u; i < params.kVec4; i = i + 1u) {
+    let weight = bf16x4(w[base + i]);
+    acc0 = acc0 + dot(weight, x[xb0 + i]);
+    acc1 = acc1 + dot(weight, x[xb1 + i]);
+    acc2 = acc2 + dot(weight, x[xb2 + i]);
+    acc3 = acc3 + dot(weight, x[xb3 + i]);
+  }
+
+  if (colBase < params.mCols) {
+    dst[colBase * params.numRows + row] = params.alpha * acc0;
+  }
+  if (colBase + 1u < params.mCols) {
+    dst[(colBase + 1u) * params.numRows + row] = params.alpha * acc1;
+  }
+  if (colBase + 2u < params.mCols) {
+    dst[(colBase + 2u) * params.numRows + row] = params.alpha * acc2;
+  }
+  if (colBase + 3u < params.mCols) {
+    dst[(colBase + 3u) * params.numRows + row] = params.alpha * acc3;
+  }
+}
+`;
+}
+
 // ---------------------------------------------------------------------------------------------
 // The CPU oracle.
 // ---------------------------------------------------------------------------------------------
@@ -247,6 +318,12 @@ function bindDenseMatmul(input: KernelBindInput): KernelBindResult {
   };
 }
 
+function bindDenseMatmulPrefill4(input: KernelBindInput): KernelBindResult {
+  const bound = bindDenseMatmul(input);
+  const mCols = (input.params.mCols ?? 1) | 0;
+  return { ...bound, dispatch: [bound.dispatch[0], Math.ceil(mCols / 4), bound.dispatch[2]] };
+}
+
 export const denseMatmulKernel: Kernel = {
   name: 'dense-bf16-matmul',
   wgsl: DENSE_MATMUL_WGSL,
@@ -299,4 +376,12 @@ export const denseMatmulKernel: Kernel = {
     },
   ],
   bind: bindDenseMatmul,
+};
+
+export const denseMatmulPrefill4Kernel: Kernel = {
+  ...denseMatmulKernel,
+  name: 'dense-bf16-prefill4',
+  wgsl: denseMatmulTiledWgsl(),
+  cases: [...denseMatmulKernel.cases],
+  bind: bindDenseMatmulPrefill4,
 };

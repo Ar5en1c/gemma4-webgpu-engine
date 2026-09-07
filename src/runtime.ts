@@ -94,6 +94,9 @@ export interface GpuExecutorOptions {
    */
   attentionPrologue?: boolean;
   batchProjections?: boolean;
+  singleTokenGemm?: boolean;
+  readonly prefillGemm4Tile?: 4 | 8;
+  readonly prefillDenseTile?: 1 | 4;
   /**
    * On a one token step the PLE projection reads its layer's row in place out of the per layer
    * input, through an offset in its params, instead of copying the row into a slot of its own
@@ -190,6 +193,9 @@ interface DecodePlanCache {
 export class GpuExecutor implements ForwardExecutor {
   private readonly attentionPrologue: boolean;
   private readonly batchProjections: boolean;
+  private readonly singleTokenGemm: boolean;
+  private readonly prefillGemm4Tile: 4 | 8;
+  private readonly prefillDenseTile: 1 | 4;
   private readonly directPle: boolean;
   readonly arch: Gemma4Arch;
   readonly kvLayout: KvLayout;
@@ -293,6 +299,9 @@ export class GpuExecutor implements ForwardExecutor {
   constructor(options: GpuExecutorOptions) {
     this.attentionPrologue = options.attentionPrologue ?? true;
     this.batchProjections = options.batchProjections ?? false;
+    this.singleTokenGemm = options.singleTokenGemm ?? false;
+    this.prefillGemm4Tile = options.prefillGemm4Tile ?? 8;
+    this.prefillDenseTile = options.prefillDenseTile ?? 1;
     this.directPle = options.directPle ?? true;
     this.gpu = options.gpu;
     this.pipelines = options.pipelines;
@@ -494,6 +503,9 @@ export class GpuExecutor implements ForwardExecutor {
   private geometryFor(mode: 'gemv' | 'gemm', tokens: number, startPosition: number): ForwardGeometry {
     return {
       directPle: this.directPle,
+      singleTokenGemm: this.singleTokenGemm,
+      prefillGemm4Tile: this.prefillGemm4Tile,
+      prefillDenseTile: this.prefillDenseTile,
       arch: this.arch,
       mode,
       tokens,

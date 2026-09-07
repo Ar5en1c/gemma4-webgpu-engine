@@ -148,9 +148,9 @@ import {
   qgemv2GeluSplitWideKernel,
 } from './qgemvWide';
 import { qNormRopeKernel, kvPrologueKernel, qNormRopeFoldKernel, kvPrologueFoldKernel } from './attnPrologue';
-import { qgemm2Kernel, qgemm4Kernel } from './qgemm';
+import { qgemm2Kernel, qgemm2SingleKernel, qgemm4Kernel, qgemm4Prefill4Kernel, qgemm4SingleKernel } from './qgemm';
 import { qmatmul8Kernel } from './pleMatmul';
-import { denseMatmulKernel } from './denseMatmul';
+import { denseMatmulKernel, denseMatmulPrefill4Kernel } from './denseMatmul';
 import { argmaxFinalKernel, argmaxPartialKernel } from './argmax';
 import { attentionDecodeKernel, attentionPrefillKernel, attentionDecodeSplitKernel, attentionMergeKernel } from './attention';
 import { kvCacheStoreKernel } from './kvStore';
@@ -187,7 +187,10 @@ export const KERNELS: Kernel[] = [
   qkvBatchKernel, gateUpBatch4Kernel, gateUpBatch2Kernel,
   qgemv2Kernel,
   qgemm4Kernel,
+  qgemm4SingleKernel,
+  qgemm4Prefill4Kernel,
   qgemm2Kernel,
+  qgemm2SingleKernel,
   qgemv4GeluKernel,
   qgemv2GeluKernel,
   qgemv2GeluSplitKernel,
@@ -223,6 +226,7 @@ export const KERNELS: Kernel[] = [
   qmatmul8Kernel,
   qgemv8Kernel,
   denseMatmulKernel,
+  denseMatmulPrefill4Kernel,
   argmaxPartialKernel,
   argmaxFinalKernel,
   // The attention family: K9 then K8, in store-before-attend order because that is also the

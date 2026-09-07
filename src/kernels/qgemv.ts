@@ -417,8 +417,17 @@ export function qgemvWgsl(
   prologue: GemvPrologue = 'none',
   split = false,
   exactPartials = false,
+  calibratedF32 = false,
 ): string {
   assertGeometry(geometry as GemvGeometry);
+  if (calibratedF32 && (
+    bits !== 4
+    || split
+    || exactPartials
+    || (geometry.inner !== undefined && geometry.inner !== 'classic')
+  )) {
+    throw new Error('calibrated f32 requires classic unsplit 4-bit GEMV without exact partials');
+  }
   if (exactPartials && (bits === 2 || !split)) throw new Error('unscaled partials require a 4-bit or 8-bit split');
   if (exactPartials && geometry.inner !== undefined && geometry.inner !== 'classic') {
     throw new Error('unscaled partials require the classic packed layout');
@@ -457,23 +466,26 @@ export function qgemvWgsl(
   // The integer path body for one lane vector at vector index `wi`: the activation codes for the
   // V * vec4PerWord vec4s the vector covers, loaded once and shared across the R rows, then one
   // unpack and one integer dot per (row, word).
-  const intBody = (): string => {
+  const intBody = (domain: 'i32' | 'f32' = 'i32'): string => {
+    const f32 = domain === 'f32';
+    const domainWordNames = f32 ? wordNames : wordNamesI;
+    const domainUnpack = f32 ? unpack : unpackI;
     const lines: string[] = [];
     lines.push(`      let xb0 = wi * ${V * vec4PerWord}u;`);
     for (let c = 0; c < V; c += 1) {
       for (let j = 0; j < vec4PerWord; j += 1) {
-        lines.push(`      let x_${c}_${j} = srqIn(${xr(`xb0 + ${c * vec4PerWord + j}u`)});`);
+        lines.push(`      let x_${c}_${j} = ${f32 ? 'srqInF' : 'srqIn'}(${xr(`xb0 + ${c * vec4PerWord + j}u`)});`);
       }
     }
     for (let r = 0; r < R; r += 1) {
       lines.push(`      let wv${r} = wq[base${r} + wi];`);
       for (let c = 0; c < V; c += 1) {
         const word = V === 1 ? `wv${r}` : `wv${r}[${c}]`;
-        const dots = wordNamesI.map((n, j) => `dot(${n}, x_${c}_${j})`).join(' + ');
+        const dots = domainWordNames.map((n, j) => `dot(${n}, x_${c}_${j})`).join(' + ');
         lines.push('      {');
         lines.push(`        let w = ${word};`);
-        lines.push(indent(unpackI, 8));
-        lines.push(`        acc${r}i = acc${r}i + ${dots};`);
+        lines.push(indent(domainUnpack, 8));
+        lines.push(`        acc${r}${f32 ? '' : 'i'} = acc${r}${f32 ? '' : 'i'} + ${dots};`);
         lines.push('      }');
       }
     }
@@ -535,6 +547,46 @@ export function qgemvWgsl(
   const floatFrom = KS === 1 ? '0u' : 'oLo';
   const floatTo = KS === 1 ? 'kOnes' : 'oHi';
   const floatStart = KS === 1 ? 'lane' : 'lane + oLo * 32u';
+  const calibratedBody = calibratedF32 ? `    // At K <= 12288, |-8 * -128| = 1024 and the full sum is at most
+    // 12,582,912, below 2^24, so f32 carries every integer partial and total exactly.
+    if (params.kWords <= 1536u) {
+      var wi = ${intStart};
+      for (var i = ${intFrom}; i < ${intTo}; i = i + 1u) {
+${intBody('f32')}
+        wi = wi + 32u;
+      }
+      if (${tailGuard}) {
+${intBody('f32')}
+      }
+    } else {
+${accIDecls}
+      var wi = ${intStart};
+      for (var i = ${intFrom}; i < ${intTo}; i = i + 1u) {
+${intBody()}
+        wi = wi + 32u;
+      }
+      if (${tailGuard}) {
+${intBody()}
+      }
+${accHandoff}
+    }` : `${accIDecls}
+    var wi = ${intStart};
+    for (var i = ${intFrom}; i < ${intTo}; i = i + 1u) {
+${intBody()}
+      wi = wi + 32u;
+    }
+    // The tail: the lanes whose vector still lies inside the row. Loads and adds only, so the
+    // reductions after the branch are still reached by every lane.
+    if (${tailGuard}) {
+${intBody()}
+    }
+${accHandoff}`;
+  const srqInF = calibratedF32 ? `
+// The same SRQ snap as srqIn, retaining the integer codes in f32 for the exact bounded path.
+fn srqInF(v: vec4<f32>) -> vec4<f32> {
+  return clamp(round(v / params.inScale), vec4<f32>(SRQ_MIN), vec4<f32>(SRQ_MAX));
+}
+` : '';
 
   const code = /* wgsl */ `${matmulReducePrelude(variant, W)}
 struct GemvParams {
@@ -572,7 +624,7 @@ const SRQ_MIN: f32 = -128.0;
 fn srqIn(v: vec4<f32>) -> vec4<i32> {
   return vec4<i32>(clamp(round(v / params.inScale), vec4<f32>(SRQ_MIN), vec4<f32>(SRQ_MAX)));
 }
-
+${srqInF}
 // The SRQ output epilogue, the module's output_activation_scale applied to the row it just
 // computed. A zero scale returns the value untouched, exactly as the reference treats an
 // uncalibrated site. The branch is uniform: the scale comes from the uniform block.
@@ -610,18 +662,7 @@ ${accDecls}
     // The ratified integer path. Codes times codes through the integer dot(), accumulated in
     // i32 with no rounding anywhere: the worst text stack reduction is bounded near 6.3e6, far
     // inside i32 and inside f32's exact integer range, so the f32 handoff below is exact too.
-${accIDecls}
-    var wi = ${intStart};
-    for (var i = ${intFrom}; i < ${intTo}; i = i + 1u) {
-${intBody()}
-      wi = wi + 32u;
-    }
-    // The tail: the lanes whose vector still lies inside the row. Loads and adds only, so the
-    // reductions after the branch are still reached by every lane.
-    if (${tailGuard}) {
-${intBody()}
-    }
-${accHandoff}
+${calibratedBody}
   } else {
     // The uncalibrated path, the round 1 f32 code dot, byte for byte in its accumulation order:
     // one word per lane, word lane + 32 i, whatever the vector width of the binding.
