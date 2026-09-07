@@ -1,10 +1,10 @@
 {
   "repository": "https://github.com/Ar5en1c/purrview",
-  "revision": "970ef0288b4e828ab763fb3d0b5a959fd9bf7aa7",
+  "revision": "6e02b9d6e022291d465c07f9fa7b38de8cb677aa",
   "directory": "src/engine/gemma4",
   "excludes": [
     "dev"
   ],
   "normalization": "CRLF to LF; LICENSE and NOTICE at repository root",
-  "syncedOn": "2026-09-06"
+  "syncedOn": "2026-09-07"
 }

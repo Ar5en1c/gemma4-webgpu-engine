@@ -32,7 +32,7 @@ import { SUBGROUP_SELFTEST_WGSL, subgroupSelfTestExpected } from './kernels/subg
 import type { MatmulReduceVariant } from './kernels/qgemv';
 import { qgemvWgsl, gemvGeometry, unsplitGemvGeometry, GEMV_GELU_SPLIT_KERNEL_2BIT, GEMV_SPLIT_KERNEL } from './kernels/qgemv';
 import { gemvWideKernelName, qgemv2GeluSplitWideFallbackWgsl, qgemvWideWgsl } from './kernels/qgemvWide';
-import { QGEMM4_FALLBACK_WGSL } from './kernels/qgemm';
+import { QGEMM4_FALLBACK_WGSL, QGEMM4_PREFILL4_FALLBACK_WGSL, QGEMM4_SINGLE_FALLBACK_WGSL } from './kernels/qgemm';
 import { RMS_NORM_FALLBACK_WGSL, RMS_NORM_WEIGHTLESS_FALLBACK_WGSL } from './kernels/rmsNorm';
 import {
   KV_PROLOGUE_FALLBACK_WGSL, KV_PROLOGUE_FOLD_KERNEL, KV_PROLOGUE_KERNEL, Q_NORM_ROPE_FALLBACK_WGSL, Q_NORM_ROPE_FOLD_KERNEL, Q_NORM_ROPE_KERNEL,
@@ -94,6 +94,8 @@ export const FALLBACK_WGSL: Readonly<Record<string, string>> = Object.freeze({
   // The wide split sibling reads the live geometry, as the one column split above does.
   get [gemvWideKernelName(2, 'gelu', true)](): string { return qgemv2GeluSplitWideFallbackWgsl(); },
   'qgemm-4bit': QGEMM4_FALLBACK_WGSL,
+  'qgemm-4bit-single': QGEMM4_SINGLE_FALLBACK_WGSL,
+  'qgemm-4bit-prefill4': QGEMM4_PREFILL4_FALLBACK_WGSL,
   // qgemm-2bit reduces nothing (a lane per output row) and has one build under both policies.
   'argmax-partial': ARGMAX_PARTIAL_FALLBACK_WGSL,
   'argmax-final': ARGMAX_FINAL_FALLBACK_WGSL,

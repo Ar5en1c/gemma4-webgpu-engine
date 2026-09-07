@@ -18,9 +18,14 @@ const batchGeometry = (bits: GemvBits) => {
   return bits === 2 && batchWorkgroup ? { ...g, workgroupSize: batchWorkgroup } : g;
 };
 
-export function projectionBatchWgsl(bits: GemvBits, count: 2 | 3, variant: MatmulReduceVariant): string {
+export function projectionBatchWgsl(
+  bits: GemvBits,
+  count: 2 | 3,
+  variant: MatmulReduceVariant,
+  calibratedF32 = false,
+): string {
   const geometry = batchGeometry(bits);
-  let code = qgemvWgsl(bits, variant, geometry);
+  let code = qgemvWgsl(bits, variant, geometry, 'none', false, false, calibratedF32);
   const type = bits === 2 ? 'vec4<u32>' : geometry.wordsPerLane === 1 ? 'u32' : `vec${geometry.wordsPerLane}<u32>`;
   const expected = ['struct GemvParams {', 'let group = wid.x + nwg.x * wid.y;'];
   for (const needle of expected) if (!code.includes(needle)) throw new Error(`projection batch source contract changed: ${needle}`);
@@ -39,7 +44,7 @@ export function projectionBatchWgsl(bits: GemvBits, count: 2 | 3, variant: Matmu
   code = code.replace(/^@group\(0\) @binding\(\d+\).*;\n?/gm, '');
   // Specialize the resource choice outside the dot loop. Every workgroup enters one
   // original GEMV body with static weight bindings and its own SRQ scale pair.
-  const original = qgemvWgsl(bits, variant, geometry);
+  const original = qgemvWgsl(bits, variant, geometry, 'none', false, false, calibratedF32);
   const header = original.slice(0, original.indexOf('struct GemvParams {'));
   const uniformStruct = code.slice(code.indexOf('struct GemvParams {'), code.indexOf('struct GemvParams {') + code.slice(code.indexOf('struct GemvParams {')).indexOf('}') + 1);
   let binding = 0;

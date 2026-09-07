@@ -132,6 +132,10 @@ export interface ResolvedStep {
 export interface ForwardGeometry {
   /** Single-token PLE reads its contiguous layer row in place instead of copying it. */
   readonly directPle?: boolean;
+  /** Route one-token prefill GEMMs through their one-column experimental kernels. */
+  readonly singleTokenGemm?: boolean;
+  readonly prefillGemm4Tile?: 4 | 8;
+  readonly prefillDenseTile?: 1 | 4;
   readonly arch: Gemma4Arch;
   /** 'gemv' for a decode step, 'gemm' for a prefill chunk. Matches the step plan's mode. */
   readonly mode: 'gemv' | 'gemm';
@@ -403,8 +407,24 @@ function matmulKernel(geometry: ForwardGeometry, stepKernel: string): string {
   // The plan already chose the family and the mode; this only asserts the two agree, because a
   // gemv kernel handed a multi token chunk writes one row and leaves the rest as noise.
   const wantsGemm = geometry.mode === 'gemm';
-  if (wantsGemm && stepKernel.startsWith('qgemv-')) {
-    return stepKernel.replace('qgemv-', 'qgemm-');
+  if (wantsGemm) {
+    const kernel = stepKernel.startsWith('qgemv-')
+      ? stepKernel.replace('qgemv-', 'qgemm-')
+      : stepKernel;
+    if (
+      geometry.tokens === 1
+      && geometry.singleTokenGemm === true
+      && (kernel === 'qgemm-2bit' || kernel === 'qgemm-4bit')
+    ) {
+      return `${kernel}-single`;
+    }
+    if (geometry.tokens > 1 && geometry.prefillGemm4Tile === 4 && kernel === 'qgemm-4bit') {
+      return 'qgemm-4bit-prefill4';
+    }
+    if (geometry.tokens > 1 && geometry.prefillDenseTile === 4 && kernel === 'dense-bf16-matmul') {
+      return 'dense-bf16-prefill4';
+    }
+    return kernel;
   }
   return gemvWide(geometry, stepKernel);
 }
@@ -511,7 +531,7 @@ export function resolveStep(step: DispatchStep, geometry: ForwardGeometry): Reso
         alpha: perLayerProjectionScale(arch),
       };
       if (geometry.mode === 'gemm' || tokens > 1) params.mCols = tokens;
-      return make('dense-bf16-matmul', {
+      return make(matmulKernel(geometry, 'dense-bf16-matmul'), {
         w: weight(`${LM}.per_layer_model_projection.weight`),
         x: residual(false),
       }, s('ple.projection'), params);

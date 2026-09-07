@@ -102,6 +102,10 @@ export interface Gemma4ProfileTuning {
   readonly decodeLookahead: Tuned<number>;
   /** Independent Q/K/V and gate/up producers share dispatches without changing their dot loops. */
   readonly decodeBatchProjections: Tuned<boolean>;
+  /** Token-column geometry for prefill only; independent of decode geometry. */
+  readonly prefillSingleTokenGemm: Tuned<boolean>;
+  readonly prefillGemm4Tile: Tuned<4 | 8>;
+  readonly prefillDenseTile: Tuned<1 | 4>;
   /** Workgroup width of batched 2-bit gate/up only; down and head retain their geometry. */
   readonly decodeBatch2WorkgroupWidth: Tuned<number>;
   /** Calibrated producer down dots split before scaling, then fold exactly. */
@@ -453,6 +457,9 @@ const M1_PROFILE: Gemma4DeviceProfile = {
         + 'bench that predicted a win was wrong by 3.7x in the other direction. 8 cores cannot '
         + 'use the workgroups a split creates.',
     },
+    prefillSingleTokenGemm: { value: true, tuningReason: 'Measured on the 8-core M1 with Chrome 152: one-column final-token prefill plus four-column GEMM/dense reduced warm TTFT 24.1 to 42.7 percent across five prompts in 75 paired samples, with exact baseline IDs. See lab-results/m1-prefill-sep06.json. Other Apple chips remain unmeasured.' },
+    prefillGemm4Tile: { value: 4, tuningReason: 'Four scalar token columns are part of the accepted M1 prefill combination: median per-prompt TTFT reduction 32.7 percent, with no established decode gain. See lab-results/m1-prefill-sep06.json. This is not a measurement of other Apple chips.' },
+    prefillDenseTile: { value: 4, tuningReason: 'Reuse each BF16 weight across four prefill token columns in the accepted M1 combination; 129 kernel cases pass under each reduction policy and full-model numerical results match the control, including five historical failures. See lab-results/m1-prefill-sep06.json. Other Apple chips remain unmeasured.' },
     decodeBatch2WorkgroupWidth: { value: 32, tuningReason: 'The September 6 M1 paired 32 versus 64 comparison did not establish a consistent advantage for 64. Retain 32; see lab-results/m1-decode-sep06.json.' },
     decodeBatchProjections: {
       value: true,
@@ -583,6 +590,9 @@ const GENERIC_PROFILE: Gemma4DeviceProfile = {
       value: 1,
       tuningReason: 'no split, for the same reason as attentionKvSplits. Not measured on this device.',
     },
+    prefillSingleTokenGemm: { value: false, tuningReason: 'Retain the existing prefill geometry until repeated end-to-end validation accepts the optional one-column kernels on this device family.' },
+    prefillGemm4Tile: { value: 8, tuningReason: 'Retain the existing eight-column prefill GEMM geometry outside a validated device-specific override.' },
+    prefillDenseTile: { value: 1, tuningReason: 'Retain the existing one-column dense projection outside a validated prefill-specific device override.' },
     decodeBatch2WorkgroupWidth: { value: 32, tuningReason: 'Retain the existing 2-bit producer width outside the measured Blackwell profile.' },
     decodeBatchProjections: { value: false, tuningReason: 'Not measured on this device family; retain separate projections.' },
     decodeProducerDownKSplits: { value: 1, tuningReason: 'Not measured on this device family; retain the original producer down dot.' },
@@ -727,6 +737,9 @@ const RTX5070_PROFILE: Gemma4DeviceProfile = {
         + '16 percent and moved not one token in 192 (5070-both-splits-d1-d5-sep04.json). '
         + 'kSplits 4 loses 1.2 to 1.8 percent to 8 (5070-geometry-sweep-e-family-sep04.json).',
     },
+    prefillSingleTokenGemm: { value: false, tuningReason: 'Retain the existing prefill geometry until repeated end-to-end validation accepts the optional one-column kernels on this device family.' },
+    prefillGemm4Tile: { value: 8, tuningReason: 'Retain the existing eight-column prefill GEMM geometry outside a validated device-specific override.' },
+    prefillDenseTile: { value: 1, tuningReason: 'Retain the existing one-column dense projection outside a validated prefill-specific device override.' },
     decodeBatch2WorkgroupWidth: { value: 64, tuningReason: 'RTX 5070, cx74-cx76: wider batched 2-bit producers improve eight-prompt median by about 1 percent; 64, 128 and 256 are close, so keep 64. Per-projection arithmetic and IDs unchanged. lab-results/5070-codex-projection-splits-sep06.json.' },
     decodeBatchProjections: { value: true, tuningReason: 'RTX 5070 Chrome 152, cx20 between cx15/cx21 controls: about 5 percent faster across eight prompts, all 2560 generated IDs identical. GPU subgroup and workgroup fixtures exact, full parity r8.' },
     decodeProducerDownKSplits: { value: 2, tuningReason: 'RTX 5070 cx33-cx36: about 1 percent over batched projections. Split integer dots before scaling to preserve every sum; full parity r9.' },
@@ -792,6 +805,9 @@ const FIELDS: readonly Gemma4ProfileField[] = Object.freeze([
   'decodeGemv2KSplits',
   'decodeLookahead',
   'decodeBatchProjections',
+  'prefillSingleTokenGemm',
+  'prefillGemm4Tile',
+  'prefillDenseTile',
   'decodeBatch2WorkgroupWidth',
   'decodeProducerDownKSplits',
   'decodePleGateKSplits',
