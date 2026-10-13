@@ -1,7 +1,7 @@
 {
   "name": "gemma4-webgpu-engine",
   "version": "0.1.0",
-  "description": "A clean-room WebGPU inference engine for Google's Gemma 4 E2B, running entirely in the browser.",
+  "description": "A WebGPU inference engine for Google's Gemma 4 E2B, running in the browser.",
   "license": "Apache-2.0",
   "type": "module",
   "main": "src/index.ts",

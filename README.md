@@ -1,6 +1,6 @@
 # Gemma 4 WebGPU Engine
 
-A clean-room WebGPU inference engine for Google's **Gemma 4 E2B**, running entirely in the browser.
+A WebGPU inference engine for Google's **Gemma 4 E2B**, running in the browser.
 No server, no WASM runtime, no ONNX. It fetches the quantized weights from Hugging Face, keeps them
 in IndexedDB, and does every matmul in WGSL compute shaders.
 
@@ -16,27 +16,15 @@ See [NOTICE](NOTICE).
 
 ## Where it stands
 
-Measured on one M1 MacBook, both engines interleaved in the same session, eight app prompts,
-against the engine it was written to replace:
+Speed figures published here earlier have been withdrawn, and a new measurement is not published
+yet. The bench page in this repo measures your own hardware.
 
-| | result |
-|---|---|
-| time to first token | **1.73x to 2.33x faster**, all eight prompts |
-| decode tokens/sec | 1.005x to 1.024x faster, all eight prompts |
-| warm turn, end to end | **1.89x faster** |
+One optimization in the engine comes from the model's structure. Gemma 4 E2B computes its KV cache
+in 15 of its 35 layers and the other 20 only consume it, so during prefill every position except the
+last needs only the producer half, and the engine skips the rest. The generated tokens do not change.
+The time this saves has not been measured on the current build.
 
-Read those as ratios on one machine in one session, which is what an interleaved A/B licenses. They
-are not a portable claim about your hardware, which is exactly what the bench page in this repo is
-for.
-
-The time to first token result comes from one architectural property rather than from kernel
-tuning. Gemma 4 E2B computes its KV cache in 15 of its 35 layers and the other 20 only consume it,
-so during prefill every position except the last needs only the producer half. Skipping the rest
-removes **59.0 percent of a prefill chunk**, exactly and bit identically. Three months of kernel
-work before that moved the same number about 1.15x.
-
-To be clear about what is and is not new: this optimization is known, and vLLM and onnxruntime both
-ship a version of it. As far as we can tell this is the first **browser** engine to do it.
+This optimization is not new: vLLM and onnxruntime both ship a version of it.
 
 ## Requirements
 
@@ -52,15 +40,14 @@ ship a version of it. As far as we can tell this is the first **browser** engine
 
 ## Current engine snapshot
 
-The engine is synced from Purrview revision `73fb4d2`. Exact source provenance is recorded in
+The engine is synced from the private Purrview repository. The exact revision is recorded in
 [engine-source.json](engine-source.json) and included in copied benchmark results. This update
 includes the latest projection batching, exact integer splits, and device profile tuning.
 Blackwell-specific settings remain confined to that profile; Mac hardware uses its Apple profile.
 
 On the RTX 5070, the latest eight-prompt runs measured 296.5 to 296.95 tokens/sec against
 272.75 to 273.25 in matching controls, with identical generated IDs. Those numbers use the
-Purrview benchmark harness, not this page's three-prompt test. The updated Mac build needs a new
-measurement; the earlier M1 results above are historical.
+Purrview benchmark harness, not this page's three-prompt test.
 
 ## Try it
 
@@ -112,9 +99,8 @@ TypeScript and WGSL source under `src/`, with no runtime dependencies.
 
 Written as an independent implementation from Google's published Gemma 4 architecture and config
 files, the safetensors format, the Hugging Face `transformers` reference (Apache-2.0), and this
-project's own measurement record. **It contains no code from any third-party inference engine**, and
-no such engine's source or shaders were read during development. That rule was enforced throughout,
-including while benchmarking against one.
+project's own measurement record. It was written without copying code from any other inference
+engine.
 
 ## Licence
 
